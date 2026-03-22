@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
 
 	"github.com/defenseclaw/defenseclaw/internal/firewall"
 	"github.com/defenseclaw/defenseclaw/internal/firewall/platform"
@@ -223,19 +222,3 @@ func printApplyInstructions(compiler firewall.Compiler, rulesPath string) {
 	fmt.Printf("    %s\n", compiler.ApplyCommand(rulesPath))
 }
 
-// firewallConfigPreview returns a human-readable summary of firewall.yaml for
-// use in other commands (e.g. scan drift warning). Returns "" if not configured.
-func firewallConfigPreview() string {
-	if cfg == nil || cfg.Firewall.ConfigFile == "" {
-		return ""
-	}
-	fwCfg, err := firewall.Load(cfg.Firewall.ConfigFile)
-	if err != nil {
-		return ""
-	}
-	data, err := yaml.Marshal(fwCfg.Allowlist)
-	if err != nil {
-		return ""
-	}
-	return string(data)
-}
