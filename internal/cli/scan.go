@@ -42,11 +42,19 @@ var scanAIBOMCmd = &cobra.Command{
 	RunE:  runScanAIBOM,
 }
 
+var scanCodeCmd = &cobra.Command{
+	Use:   "code <path>",
+	Short: "Scan code with CodeGuard security rules",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runScanCode,
+}
+
 func init() {
 	rootCmd.AddCommand(scanCmd)
 	scanCmd.AddCommand(scanSkillCmd)
 	scanCmd.AddCommand(scanMCPCmd)
 	scanCmd.AddCommand(scanAIBOMCmd)
+	scanCmd.AddCommand(scanCodeCmd)
 }
 
 func runScanSkill(cmd *cobra.Command, args []string) error {
@@ -86,6 +94,11 @@ func runScanAIBOM(cmd *cobra.Command, args []string) error {
 	return execScanner(cmd.Context(), s, target)
 }
 
+func runScanCode(cmd *cobra.Command, args []string) error {
+	s := scanner.NewCodeGuardScanner(cfg.Scanners.CodeGuard)
+	return execScanner(cmd.Context(), s, args[0])
+}
+
 func runScanAll(cmd *cobra.Command, args []string) error {
 	target := "."
 	if len(args) > 0 {
@@ -96,6 +109,7 @@ func runScanAll(cmd *cobra.Command, args []string) error {
 		scanner.NewSkillScanner(cfg.Scanners.SkillScanner),
 		scanner.NewMCPScanner(cfg.Scanners.MCPScanner),
 		scanner.NewAIBOMScanner(cfg.Scanners.AIBOM),
+		scanner.NewCodeGuardScanner(cfg.Scanners.CodeGuard),
 	}
 
 	var errs []string

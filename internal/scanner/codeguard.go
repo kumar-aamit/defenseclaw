@@ -1,25 +1,227 @@
 package scanner
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
 )
 
 type CodeGuardScanner struct {
-	BinaryPath string
+	RulesDir string
 }
 
-func NewCodeGuardScanner(binaryPath string) *CodeGuardScanner {
-	if binaryPath == "" {
-		binaryPath = "codeguard"
+func NewCodeGuardScanner(rulesDir string) *CodeGuardScanner {
+	if rulesDir == "" {
+		home, _ := os.UserHomeDir()
+		rulesDir = filepath.Join(home, ".defenseclaw", "codeguard-rules")
 	}
-	return &CodeGuardScanner{BinaryPath: binaryPath}
+	return &CodeGuardScanner{RulesDir: rulesDir}
 }
 
 func (s *CodeGuardScanner) Name() string              { return "codeguard" }
-func (s *CodeGuardScanner) Version() string            { return "0.1.0" }
+func (s *CodeGuardScanner) Version() string            { return "1.0.0" }
 func (s *CodeGuardScanner) SupportedTargets() []string { return []string{"code"} }
 
-func (s *CodeGuardScanner) Scan(_ context.Context, _ string) (*ScanResult, error) {
-	return nil, fmt.Errorf("scanner: codeguard integration not yet implemented — coming in iteration 4")
+func (s *CodeGuardScanner) Scan(_ context.Context, target string) (*ScanResult, error) {
+	start := time.Now()
+
+	result := &ScanResult{
+		Scanner:   s.Name(),
+		Target:    target,
+		Timestamp: start,
+	}
+
+	info, err := os.Stat(target)
+	if err != nil {
+		return nil, fmt.Errorf("scanner: codeguard: %w", err)
+	}
+
+	var files []string
+	if info.IsDir() {
+		files, err = collectCodeFiles(target)
+		if err != nil {
+			return nil, fmt.Errorf("scanner: codeguard: walk %s: %w", target, err)
+		}
+	} else {
+		files = []string{target}
+	}
+
+	for _, f := range files {
+		findings, err := scanFile(f)
+		if err != nil {
+			continue
+		}
+		result.Findings = append(result.Findings, findings...)
+	}
+
+	result.Duration = time.Since(start)
+	return result, nil
+}
+
+var codeExtensions = map[string]bool{
+	".py": true, ".js": true, ".ts": true, ".go": true,
+	".java": true, ".rb": true, ".php": true, ".sh": true,
+	".yaml": true, ".yml": true, ".json": true, ".xml": true,
+	".c": true, ".cpp": true, ".h": true, ".rs": true,
+}
+
+func collectCodeFiles(root string) ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			base := d.Name()
+			if base == ".git" || base == "node_modules" || base == "__pycache__" || base == ".venv" || base == "venv" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if codeExtensions[filepath.Ext(path)] {
+			files = append(files, path)
+		}
+		return nil
+	})
+	return files, err
+}
+
+type rule struct {
+	id          string
+	severity    Severity
+	title       string
+	pattern     *regexp.Regexp
+	remediation string
+	extensions  []string
+}
+
+var builtinRules = []rule{
+	{
+		id:          "CG-CRED-001",
+		severity:    SeverityHigh,
+		title:       "Hardcoded API key or secret",
+		pattern:     regexp.MustCompile(`(?i)(api[_-]?key|secret[_-]?key|access[_-]?token|private[_-]?key)\s*[:=]\s*["'][^\s"']{16,}["']`),
+		remediation: "Move credentials to environment variables or a secrets manager",
+	},
+	{
+		id:          "CG-CRED-002",
+		severity:    SeverityHigh,
+		title:       "AWS access key ID",
+		pattern:     regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+		remediation: "Rotate the key and store in AWS Secrets Manager or environment variables",
+	},
+	{
+		id:          "CG-CRED-003",
+		severity:    SeverityCritical,
+		title:       "Private key embedded in source",
+		pattern:     regexp.MustCompile(`-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----`),
+		remediation: "Remove the private key from source code; use a certificate store or secrets manager",
+	},
+	{
+		id:          "CG-EXEC-001",
+		severity:    SeverityHigh,
+		title:       "Unsafe command execution",
+		pattern:     regexp.MustCompile(`(?i)(os\.system|subprocess\.call|exec\(|child_process\.exec|eval\(|system\()`),
+		remediation: "Use parameterized execution or an allowlist of commands",
+		extensions:  []string{".py", ".js", ".ts", ".rb", ".php"},
+	},
+	{
+		id:          "CG-EXEC-002",
+		severity:    SeverityMedium,
+		title:       "Shell=True in subprocess",
+		pattern:     regexp.MustCompile(`subprocess\.\w+\(.*shell\s*=\s*True`),
+		remediation: "Avoid shell=True; pass arguments as a list",
+		extensions:  []string{".py"},
+	},
+	{
+		id:          "CG-NET-001",
+		severity:    SeverityMedium,
+		title:       "Outbound HTTP request to variable URL",
+		pattern:     regexp.MustCompile(`(?i)(requests\.(get|post|put|delete)|urllib\.request\.urlopen|fetch\(|http\.Get)\s*\(`),
+		remediation: "Validate and allowlist outbound URLs",
+		extensions:  []string{".py", ".js", ".ts", ".go"},
+	},
+	{
+		id:          "CG-DESER-001",
+		severity:    SeverityHigh,
+		title:       "Unsafe deserialization (pickle/yaml.load)",
+		pattern:     regexp.MustCompile(`(?i)(pickle\.loads?|yaml\.load\(|yaml\.unsafe_load)`),
+		remediation: "Use yaml.safe_load or json for deserialization; never unpickle untrusted data",
+		extensions:  []string{".py"},
+	},
+	{
+		id:          "CG-SQL-001",
+		severity:    SeverityHigh,
+		title:       "Potential SQL injection (string formatting in query)",
+		pattern:     regexp.MustCompile(`(?i)(execute|cursor\.execute|query)\s*\(\s*(f["']|["'].*%s|["'].*\+)`),
+		remediation: "Use parameterized queries with bind variables",
+		extensions:  []string{".py", ".js", ".ts", ".rb", ".php", ".java"},
+	},
+	{
+		id:          "CG-CRYPTO-001",
+		severity:    SeverityMedium,
+		title:       "Weak cryptographic algorithm (MD5/SHA1)",
+		pattern:     regexp.MustCompile(`(?i)(hashlib\.md5|hashlib\.sha1|MD5\.Create|SHA1\.Create|crypto\.createHash\(['"]md5|crypto\.createHash\(['"]sha1)`),
+		remediation: "Use SHA-256 or stronger; see codeguard-0-additional-cryptography",
+		extensions:  []string{".py", ".js", ".ts", ".java", ".go", ".rb"},
+	},
+	{
+		id:          "CG-PATH-001",
+		severity:    SeverityMedium,
+		title:       "Potential path traversal",
+		pattern:     regexp.MustCompile(`(?i)(\.\.\/|\.\.\\|path\.join\(.*\.\.|os\.path\.join\(.*\.\.|filepath\.Join\(.*\.\.)`),
+		remediation: "Canonicalize paths and validate against an allowed root directory",
+	},
+}
+
+func scanFile(path string) ([]Finding, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	ext := filepath.Ext(path)
+	var findings []Finding
+
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Text()
+
+		for _, r := range builtinRules {
+			if len(r.extensions) > 0 && !extMatch(ext, r.extensions) {
+				continue
+			}
+			if r.pattern.MatchString(line) {
+				findings = append(findings, Finding{
+					ID:          r.id,
+					Severity:    r.severity,
+					Title:       r.title,
+					Description: strings.TrimSpace(line),
+					Location:    fmt.Sprintf("%s:%d", path, lineNum),
+					Remediation: r.remediation,
+					Scanner:     "codeguard",
+					Tags:        []string{"codeguard"},
+				})
+			}
+		}
+	}
+
+	return findings, scanner.Err()
+}
+
+func extMatch(ext string, exts []string) bool {
+	for _, e := range exts {
+		if ext == e {
+			return true
+		}
+	}
+	return false
 }

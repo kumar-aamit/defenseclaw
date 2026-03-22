@@ -3,11 +3,76 @@ package tui
 import "github.com/charmbracelet/lipgloss"
 
 var (
-	TabStyle         = lipgloss.NewStyle().Padding(0, 2)
-	ActiveTabStyle   = lipgloss.NewStyle().Padding(0, 2).Bold(true).Foreground(lipgloss.Color("39"))
-	StatusStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
-	SeverityCritical = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
-	SeverityHigh     = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))
-	SeverityMedium   = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
-	SeverityLow      = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	// Tab bar
+	TabStyle       = lipgloss.NewStyle().Padding(0, 2).Foreground(lipgloss.Color("245"))
+	ActiveTabStyle = lipgloss.NewStyle().Padding(0, 2).Bold(true).Foreground(lipgloss.Color("39")).Underline(true)
+	TabBarStyle    = lipgloss.NewStyle().BorderBottom(true).BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("238"))
+
+	// Severity colors
+	StyleCritical = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	StyleHigh     = lipgloss.NewStyle().Foreground(lipgloss.Color("208")).Bold(true)
+	StyleMedium   = lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	StyleLow      = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	StyleInfo     = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+
+	// Status indicators
+	StyleBlocked = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
+	StyleAllowed = lipgloss.NewStyle().Foreground(lipgloss.Color("46"))
+	StyleUnknown = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+
+	// List
+	SelectedStyle = lipgloss.NewStyle().Background(lipgloss.Color("237")).Bold(true)
+	NormalStyle   = lipgloss.NewStyle()
+	HeaderStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).BorderBottom(true).BorderStyle(lipgloss.NormalBorder()).BorderForeground(lipgloss.Color("238"))
+
+	// Status bar
+	StatusBarStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color("236")).
+			Foreground(lipgloss.Color("252")).
+			Padding(0, 1)
+	StatusLabelStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("62")).
+				Foreground(lipgloss.Color("230")).
+				Padding(0, 1).
+				Bold(true)
+
+	// Detail modal
+	ModalStyle = lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("62")).
+			Padding(1, 2)
+	ModalTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
+	ModalLabelStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("245"))
+
+	// Help
+	HelpStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+
+	// Title
+	TitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("62"))
 )
+
+func SeverityStyle(sev string) lipgloss.Style {
+	switch sev {
+	case "CRITICAL":
+		return StyleCritical
+	case "HIGH":
+		return StyleHigh
+	case "MEDIUM":
+		return StyleMedium
+	case "LOW":
+		return StyleLow
+	default:
+		return StyleInfo
+	}
+}
+
+func StatusStyle(status string) lipgloss.Style {
+	switch status {
+	case "blocked":
+		return StyleBlocked
+	case "allowed":
+		return StyleAllowed
+	default:
+		return StyleUnknown
+	}
+}

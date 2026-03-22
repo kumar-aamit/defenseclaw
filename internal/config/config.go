@@ -77,7 +77,7 @@ func setDefaults(dataDir string) {
 	viper.SetDefault("scanners.skill_scanner", "skill-scanner")
 	viper.SetDefault("scanners.mcp_scanner", "mcp-scanner")
 	viper.SetDefault("scanners.aibom", "cisco-aibom")
-	viper.SetDefault("scanners.codeguard", "codeguard")
+	viper.SetDefault("scanners.codeguard", filepath.Join(dataDir, "codeguard-rules"))
 	viper.SetDefault("openshell.binary", "openshell")
 	viper.SetDefault("openshell.policy_dir", "/etc/openshell/policies")
 }

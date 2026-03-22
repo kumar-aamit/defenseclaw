@@ -5,12 +5,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 type OpenShell struct {
-	BinaryPath    string
-	PolicyDir     string
-	FallbackDir   string
+	BinaryPath  string
+	PolicyDir   string
+	FallbackDir string
 }
 
 func New(binaryPath, policyDir string) *OpenShell {
@@ -69,9 +71,68 @@ func (o *OpenShell) ReloadPolicy() error {
 	return nil
 }
 
-func (o *OpenShell) Start() error {
+func (o *OpenShell) Start(policyPath string) error {
 	if !o.IsAvailable() {
 		return fmt.Errorf("sandbox: openshell binary not found at %q", o.BinaryPath)
 	}
-	return fmt.Errorf("sandbox: openshell start not yet implemented — coming in iteration 4")
+	args := []string{"start", "--policy", policyPath}
+	cmd := exec.Command(o.BinaryPath, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("sandbox: start openshell: %w", err)
+	}
+	return writePidFile(cmd.Process.Pid)
+}
+
+func (o *OpenShell) Stop() error {
+	pid, err := readPidFile()
+	if err != nil {
+		return fmt.Errorf("sandbox: no running openshell process found: %w", err)
+	}
+
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		_ = removePidFile()
+		return fmt.Errorf("sandbox: process %d not found: %w", pid, err)
+	}
+
+	if err := proc.Signal(os.Interrupt); err != nil {
+		_ = proc.Kill()
+	}
+	_ = removePidFile()
+	return nil
+}
+
+func (o *OpenShell) IsRunning() bool {
+	pid, err := readPidFile()
+	if err != nil {
+		return false
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(nil) == nil
+}
+
+func pidFilePath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".defenseclaw", "openshell.pid")
+}
+
+func writePidFile(pid int) error {
+	return os.WriteFile(pidFilePath(), []byte(strconv.Itoa(pid)), 0o600)
+}
+
+func readPidFile() (int, error) {
+	data, err := os.ReadFile(pidFilePath())
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(data)))
+}
+
+func removePidFile() error {
+	return os.Remove(pidFilePath())
 }

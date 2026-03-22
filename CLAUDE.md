@@ -79,8 +79,8 @@ All six paths must be tested.
 
 1. ~~Skeleton + Scan + AIBOM~~ — repo structure, init, scan commands, SQLite audit ✓
 2. ~~Block/Allow + Enforcement~~ — block/allow lists, quarantine, OpenShell policy sync ✓
-3. TUI — four-panel bubbletea dashboard
-4. Deploy + CodeGuard + Full Flow — orchestrated deploy, CodeGuard, status/stop
+3. ~~TUI~~ — four-panel bubbletea dashboard (Alerts, Skills, MCP Servers + status bar) ✓
+4. ~~Deploy + CodeGuard + Full Flow~~ — orchestrated deploy, CodeGuard, status/stop ✓
 5. Docs + Plugins + OSS Polish — plugin system, installer, goreleaser, CI
 
 ## Gotchas

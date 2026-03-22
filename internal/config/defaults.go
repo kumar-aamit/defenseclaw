@@ -64,7 +64,7 @@ func DefaultConfig() *Config {
 			SkillScanner: "skill-scanner",
 			MCPScanner:   "mcp-scanner",
 			AIBOM:        "cisco-aibom",
-			CodeGuard:    "codeguard",
+			CodeGuard:    filepath.Join(dataDir, "codeguard-rules"),
 		},
 		OpenShell: OpenShellConfig{
 			Binary:    "openshell",

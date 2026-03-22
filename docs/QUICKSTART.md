@@ -92,9 +92,70 @@ defenseclaw audit -n 50
 
 Every action (scan, block, allow, quarantine, init) is logged.
 
-## 6. Next Steps
+## 6. Terminal Dashboard
 
-- `defenseclaw tui` — open the dashboard (iteration 3)
-- `defenseclaw deploy` — full orchestrated deploy (iteration 4)
+```bash
+# Launch the interactive TUI
+defenseclaw tui
+```
 
-See [CLI Reference](CLI.md) for all commands.
+The TUI has three tabs:
+- **Alerts** — color-coded severity, dismiss with `d`, view detail with `enter`
+- **Skills** — block/allow toggle with `b`/`a`, view detail with `enter`
+- **MCP Servers** — block/allow toggle with `b`/`a`, view detail with `enter`
+
+Navigation: `tab`/`shift-tab` between tabs, `j`/`k` or arrows to move, `r` to refresh, `q` to quit.
+
+Auto-refreshes every 5 seconds from SQLite.
+
+## 7. Deploy (Full Orchestrated Flow)
+
+```bash
+# Full deploy: init → scan → auto-block → policy → sandbox
+defenseclaw deploy
+
+# Deploy a specific target directory
+defenseclaw deploy ./my-project/
+
+# Skip init if already configured
+defenseclaw deploy --skip-init
+```
+
+This runs all 5 steps automatically:
+1. **Init** — ensures `~/.defenseclaw/` exists
+2. **Scan** — runs skill-scanner, mcp-scanner, aibom, and CodeGuard
+3. **Enforce** — auto-blocks anything HIGH/CRITICAL
+4. **Policy** — generates OpenShell sandbox policy from scan results
+5. **Sandbox** — starts OpenClaw in OpenShell (DGX Spark only)
+
+## 8. Code Scanning (CodeGuard)
+
+```bash
+# Scan code for security issues
+defenseclaw scan code ./path/to/code/
+```
+
+Built-in rules detect: hardcoded credentials, unsafe command execution,
+SQL injection, unsafe deserialization, weak crypto, path traversal, and more.
+
+## 9. Status & Lifecycle
+
+```bash
+# Check deployment health
+defenseclaw status
+
+# Re-scan all known targets, auto-block/unblock based on results
+defenseclaw rescan
+
+# View security alerts
+defenseclaw alerts
+defenseclaw alerts -n 50
+
+# Stop the sandbox
+defenseclaw stop
+```
+
+## 10. Next Steps
+
+- `defenseclaw tui` — interactive terminal dashboard
+- See [CLI Reference](CLI.md) for all commands.

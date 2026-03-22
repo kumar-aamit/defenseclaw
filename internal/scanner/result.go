@@ -78,6 +78,10 @@ func (r *ScanResult) IsClean() bool {
 	return len(r.Findings) == 0
 }
 
+func CompareSeverity(a, b Severity) int {
+	return severityRank[a] - severityRank[b]
+}
+
 func (r *ScanResult) JSON() ([]byte, error) {
 	return json.MarshalIndent(r, "", "  ")
 }

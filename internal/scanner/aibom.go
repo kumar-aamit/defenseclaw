@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"time"
 )
@@ -28,12 +29,19 @@ func (s *AIBOMScanner) SupportedTargets() []string { return []string{"skill", "m
 func (s *AIBOMScanner) Scan(ctx context.Context, target string) (*ScanResult, error) {
 	start := time.Now()
 
-	cmd := exec.CommandContext(ctx, s.BinaryPath, "analyze", target, "--output-format", "json", "--output-file", "/dev/stdout")
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	tmpFile, err := os.CreateTemp("", "defenseclaw-aibom-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("scanner: %s: create temp file: %w", s.Name(), err)
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(tmpPath)
+
+	cmd := exec.CommandContext(ctx, s.BinaryPath, "analyze", target, "--output-format", "json", "--output-file", tmpPath)
+	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	err := cmd.Run()
+	err = cmd.Run()
 	duration := time.Since(start)
 
 	result := &ScanResult{
@@ -47,13 +55,15 @@ func (s *AIBOMScanner) Scan(ctx context.Context, target string) (*ScanResult, er
 		if errors.Is(err, exec.ErrNotFound) {
 			return nil, fmt.Errorf("scanner: %s not found at %q — install with: uv tool install cisco-aibom", s.Name(), s.BinaryPath)
 		}
-		if stdout.Len() == 0 {
-			return nil, fmt.Errorf("scanner: %s failed: %s", s.Name(), stderr.String())
+		stderrStr := stderr.String()
+		if _, statErr := os.Stat(tmpPath); statErr != nil {
+			return nil, fmt.Errorf("scanner: %s failed: %s", s.Name(), stderrStr)
 		}
 	}
 
-	if stdout.Len() > 0 {
-		findings, parseErr := parseAIBOMOutput(stdout.Bytes())
+	data, readErr := os.ReadFile(tmpPath)
+	if readErr == nil && len(data) > 0 {
+		findings, parseErr := parseAIBOMOutput(data)
 		if parseErr != nil {
 			return nil, fmt.Errorf("scanner: failed to parse %s output: %w", s.Name(), parseErr)
 		}

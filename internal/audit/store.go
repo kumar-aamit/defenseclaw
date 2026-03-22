@@ -319,6 +319,187 @@ func (s *Store) ListAllowed() ([]AllowEntry, error) {
 	return entries, rows.Err()
 }
 
+// --- TUI Queries ---
+
+type ScanResultRow struct {
+	ID           string    `json:"id"`
+	Scanner      string    `json:"scanner"`
+	Target       string    `json:"target"`
+	Timestamp    time.Time `json:"timestamp"`
+	DurationMs   int64     `json:"duration_ms"`
+	FindingCount int       `json:"finding_count"`
+	MaxSeverity  string    `json:"max_severity"`
+}
+
+type FindingRow struct {
+	ID          string `json:"id"`
+	ScanID      string `json:"scan_id"`
+	Severity    string `json:"severity"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Location    string `json:"location"`
+	Remediation string `json:"remediation"`
+	Scanner     string `json:"scanner"`
+}
+
+func (s *Store) ListAlerts(limit int) ([]Event, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(
+		`SELECT id, timestamp, action, target, actor, details, severity
+		 FROM audit_events
+		 WHERE severity IN ('CRITICAL','HIGH','MEDIUM','LOW')
+		   AND action NOT LIKE 'dismiss%'
+		 ORDER BY timestamp DESC LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("audit: list alerts: %w", err)
+	}
+	defer rows.Close()
+
+	var events []Event
+	for rows.Next() {
+		var e Event
+		var target, details, severity sql.NullString
+		if err := rows.Scan(&e.ID, &e.Timestamp, &e.Action, &target, &e.Actor, &details, &severity); err != nil {
+			return nil, fmt.Errorf("audit: scan alert row: %w", err)
+		}
+		e.Target = target.String
+		e.Details = details.String
+		e.Severity = severity.String
+		events = append(events, e)
+	}
+	return events, rows.Err()
+}
+
+func (s *Store) ListScanResults(limit int) ([]ScanResultRow, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.Query(
+		`SELECT id, scanner, target, timestamp, duration_ms, finding_count, max_severity
+		 FROM scan_results ORDER BY timestamp DESC LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("audit: list scan results: %w", err)
+	}
+	defer rows.Close()
+
+	var results []ScanResultRow
+	for rows.Next() {
+		var r ScanResultRow
+		var maxSev sql.NullString
+		if err := rows.Scan(&r.ID, &r.Scanner, &r.Target, &r.Timestamp, &r.DurationMs, &r.FindingCount, &maxSev); err != nil {
+			return nil, fmt.Errorf("audit: scan result row: %w", err)
+		}
+		r.MaxSeverity = maxSev.String
+		results = append(results, r)
+	}
+	return results, rows.Err()
+}
+
+func (s *Store) ListFindingsByScan(scanID string) ([]FindingRow, error) {
+	rows, err := s.db.Query(
+		`SELECT id, scan_id, severity, title, description, location, remediation, scanner
+		 FROM findings WHERE scan_id = ? ORDER BY severity DESC`, scanID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("audit: list findings: %w", err)
+	}
+	defer rows.Close()
+
+	var findings []FindingRow
+	for rows.Next() {
+		var f FindingRow
+		var desc, loc, rem sql.NullString
+		if err := rows.Scan(&f.ID, &f.ScanID, &f.Severity, &f.Title, &desc, &loc, &rem, &f.Scanner); err != nil {
+			return nil, fmt.Errorf("audit: scan finding row: %w", err)
+		}
+		f.Description = desc.String
+		f.Location = loc.String
+		f.Remediation = rem.String
+		findings = append(findings, f)
+	}
+	return findings, rows.Err()
+}
+
+func (s *Store) ListBlockedByType(targetType string) ([]BlockEntry, error) {
+	rows, err := s.db.Query(
+		`SELECT id, target_type, target_name, reason, created_at
+		 FROM block_list WHERE target_type = ? ORDER BY created_at DESC`, targetType,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("audit: list blocked by type: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []BlockEntry
+	for rows.Next() {
+		var e BlockEntry
+		var reason sql.NullString
+		if err := rows.Scan(&e.ID, &e.TargetType, &e.TargetName, &reason, &e.CreatedAt); err != nil {
+			return nil, fmt.Errorf("audit: scan block row: %w", err)
+		}
+		e.Reason = reason.String
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+func (s *Store) ListAllowedByType(targetType string) ([]AllowEntry, error) {
+	rows, err := s.db.Query(
+		`SELECT id, target_type, target_name, reason, created_at
+		 FROM allow_list WHERE target_type = ? ORDER BY created_at DESC`, targetType,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("audit: list allowed by type: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []AllowEntry
+	for rows.Next() {
+		var e AllowEntry
+		var reason sql.NullString
+		if err := rows.Scan(&e.ID, &e.TargetType, &e.TargetName, &reason, &e.CreatedAt); err != nil {
+			return nil, fmt.Errorf("audit: scan allow row: %w", err)
+		}
+		e.Reason = reason.String
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+type Counts struct {
+	BlockedSkills int
+	AllowedSkills int
+	BlockedMCPs   int
+	AllowedMCPs   int
+	Alerts        int
+	TotalScans    int
+}
+
+func (s *Store) GetCounts() (Counts, error) {
+	var c Counts
+	queries := []struct {
+		sql  string
+		dest *int
+	}{
+		{`SELECT COUNT(*) FROM block_list WHERE target_type = 'skill'`, &c.BlockedSkills},
+		{`SELECT COUNT(*) FROM allow_list WHERE target_type = 'skill'`, &c.AllowedSkills},
+		{`SELECT COUNT(*) FROM block_list WHERE target_type = 'mcp'`, &c.BlockedMCPs},
+		{`SELECT COUNT(*) FROM allow_list WHERE target_type = 'mcp'`, &c.AllowedMCPs},
+		{`SELECT COUNT(*) FROM audit_events WHERE severity IN ('CRITICAL','HIGH','MEDIUM','LOW')`, &c.Alerts},
+		{`SELECT COUNT(*) FROM scan_results`, &c.TotalScans},
+	}
+	for _, q := range queries {
+		if err := s.db.QueryRow(q.sql).Scan(q.dest); err != nil {
+			return c, fmt.Errorf("audit: count query: %w", err)
+		}
+	}
+	return c, nil
+}
+
 func (s *Store) Close() error {
 	return s.db.Close()
 }
