@@ -98,5 +98,15 @@ func DefaultConfig() *Config {
 			DebounceMs: 500,
 			AutoBlock:  true,
 		},
+		Splunk: SplunkConfig{
+			HECEndpoint:   "https://localhost:8088/services/collector/event",
+			Index:         "defenseclaw",
+			Source:        "defenseclaw",
+			SourceType:    "_json",
+			VerifyTLS:     false,
+			Enabled:       false,
+			BatchSize:     50,
+			FlushInterval: 5,
+		},
 	}
 }

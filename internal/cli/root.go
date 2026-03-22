@@ -40,9 +40,13 @@ terminal dashboard for governance.`,
 		}
 
 		auditLog = audit.NewLogger(auditStore)
+		initSplunkForwarder()
 		return nil
 	},
 	PersistentPostRun: func(_ *cobra.Command, _ []string) {
+		if auditLog != nil {
+			auditLog.Close()
+		}
 		if auditStore != nil {
 			auditStore.Close()
 		}
@@ -54,4 +58,39 @@ func Execute() {
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
 	}
+}
+
+func initSplunkForwarder() {
+	if cfg == nil || !cfg.Splunk.Enabled {
+		return
+	}
+
+	token := cfg.Splunk.HECToken
+	if token == "" {
+		token = os.Getenv("DEFENSECLAW_SPLUNK_HEC_TOKEN")
+	}
+	if token == "" {
+		fmt.Fprintln(os.Stderr, "warning: splunk.enabled=true but no HEC token configured")
+		return
+	}
+
+	splunkCfg := audit.SplunkConfig{
+		HECEndpoint:   cfg.Splunk.HECEndpoint,
+		HECToken:      token,
+		Index:         cfg.Splunk.Index,
+		Source:        cfg.Splunk.Source,
+		SourceType:    cfg.Splunk.SourceType,
+		VerifyTLS:     cfg.Splunk.VerifyTLS,
+		Enabled:       true,
+		BatchSize:     cfg.Splunk.BatchSize,
+		FlushInterval: cfg.Splunk.FlushInterval,
+	}
+
+	fwd, err := audit.NewSplunkForwarder(splunkCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: splunk init: %v\n", err)
+		return
+	}
+
+	auditLog.SetSplunkForwarder(fwd)
 }

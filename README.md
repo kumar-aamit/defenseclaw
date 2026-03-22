@@ -63,6 +63,7 @@ defenseclaw tui
 - **Block/allow lists** — operator-managed enforcement with auto-blocking for HIGH/CRITICAL findings
 - **Terminal dashboard** — three-tab TUI with alerts, skills, MCP servers, and a status bar
 - **Audit trail** — every action logged to SQLite with timestamps and context
+- **Splunk SIEM** — batch export or real-time forwarding via HTTP Event Collector
 - **Sandbox orchestration** — generates and enforces NVIDIA OpenShell policy (DGX Spark)
 
 ## Documentation
@@ -72,7 +73,7 @@ defenseclaw tui
 | [Installation Guide](docs/INSTALL.md) | Step-by-step setup for DGX Spark and macOS, both existing and fresh OpenClaw deployments. Covers OpenShell, OpenClaw, and DefenseClaw installation, upgrading, and troubleshooting. |
 | [Quick Start](docs/QUICKSTART.md) | 5-minute walkthrough of every command: init, scan, block/allow, audit, TUI, deploy, CodeGuard, status, rescan, and stop. |
 | [CLI Reference](docs/CLI.md) | Complete command reference with flags, arguments, and usage examples for all subcommands. |
-| [Architecture](docs/ARCHITECTURE.md) | System diagram and data flow: Discovery, Admission, Enforcement, Runtime, and Audit layers. Cross-platform behavior matrix and key package responsibilities. |
+| [Architecture](docs/ARCHITECTURE.md) | System diagram and data flow: Discovery, Admission, Enforcement, Runtime, and Audit layers. Splunk SIEM integration. Cross-platform behavior matrix and key package responsibilities. |
 | [TUI Guide](docs/TUI.md) | Terminal dashboard usage: Alerts, Skills, and MCP Servers panels, keybindings, and navigation. |
 | [Plugin Development](docs/PLUGINS.md) | How to write a custom scanner plugin using the Go Scanner interface. Plugin discovery and gRPC protocol. |
 | [Testing](docs/TESTING.md) | How to run unit and E2E tests, manual testing on DGX Spark and macOS, and test fixture descriptions. |
@@ -125,6 +126,7 @@ make lint               # golangci-lint
 | Audit log | Full | Full |
 | TUI dashboard | Full | Full |
 | CodeGuard code scan | Full | Full |
+| Splunk SIEM export | Full | Full |
 
 ## License
 

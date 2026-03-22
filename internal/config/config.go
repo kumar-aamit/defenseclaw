@@ -19,6 +19,19 @@ type Config struct {
 	Scanners      ScannersConfig  `mapstructure:"scanners"       yaml:"scanners"`
 	OpenShell     OpenShellConfig `mapstructure:"openshell"      yaml:"openshell"`
 	Watch         WatchConfig     `mapstructure:"watch"          yaml:"watch"`
+	Splunk        SplunkConfig    `mapstructure:"splunk"         yaml:"splunk"`
+}
+
+type SplunkConfig struct {
+	HECEndpoint   string `mapstructure:"hec_endpoint"    yaml:"hec_endpoint"`
+	HECToken      string `mapstructure:"hec_token"       yaml:"hec_token"`
+	Index         string `mapstructure:"index"            yaml:"index"`
+	Source        string `mapstructure:"source"           yaml:"source"`
+	SourceType    string `mapstructure:"sourcetype"       yaml:"sourcetype"`
+	VerifyTLS     bool   `mapstructure:"verify_tls"       yaml:"verify_tls"`
+	Enabled       bool   `mapstructure:"enabled"          yaml:"enabled"`
+	BatchSize     int    `mapstructure:"batch_size"       yaml:"batch_size"`
+	FlushInterval int    `mapstructure:"flush_interval_s" yaml:"flush_interval_s"`
 }
 
 type WatchConfig struct {
@@ -93,4 +106,14 @@ func setDefaults(dataDir string) {
 	viper.SetDefault("watch.mcp_dirs", DefaultMCPWatchPaths())
 	viper.SetDefault("watch.debounce_ms", 500)
 	viper.SetDefault("watch.auto_block", true)
+
+	viper.SetDefault("splunk.hec_endpoint", "https://localhost:8088/services/collector/event")
+	viper.SetDefault("splunk.hec_token", "")
+	viper.SetDefault("splunk.index", "defenseclaw")
+	viper.SetDefault("splunk.source", "defenseclaw")
+	viper.SetDefault("splunk.sourcetype", "_json")
+	viper.SetDefault("splunk.verify_tls", false)
+	viper.SetDefault("splunk.enabled", false)
+	viper.SetDefault("splunk.batch_size", 50)
+	viper.SetDefault("splunk.flush_interval_s", 5)
 }

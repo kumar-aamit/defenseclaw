@@ -26,6 +26,7 @@ All subcommands are registered on `defenseclaw`. Use `defenseclaw help <command>
 | `stop` | Stop the OpenShell sandbox | 4 |
 | `tui` | Launch the interactive terminal dashboard | 3 |
 | `audit` | View audit log events | 1 |
+| `audit export` | Export audit events (JSON, CSV, Splunk HEC) | 5 |
 
 ## deploy
 
@@ -96,3 +97,69 @@ Displays recent security alerts (events with severity CRITICAL, HIGH, MEDIUM, or
 
 **Flags:**
 - `-n, --limit` — number of alerts to show (default: 25)
+
+## audit
+
+```
+defenseclaw audit [-n limit]
+```
+
+Displays recent audit events from the SQLite event store.
+
+**Flags:**
+- `-n, --limit` — number of events to show (default: 25)
+
+## audit export
+
+```
+defenseclaw audit export [flags]
+```
+
+Exports audit events in multiple formats for SIEM/SOAR integration.
+
+**Formats:**
+- `json` — JSON array (default)
+- `csv` — CSV with headers
+- `splunk` — Send directly to Splunk via HTTP Event Collector (HEC)
+
+**Flags:**
+- `-f, --format` — export format: `json`, `csv`, `splunk` (default: `json`)
+- `-n, --limit` — number of events to export (default: 100)
+- `-o, --output` — output file path, or `-` for stdout (default: `-`, ignored for splunk)
+
+**Examples:**
+
+```bash
+# Export last 100 events as JSON to stdout
+defenseclaw audit export
+
+# Export to a file
+defenseclaw audit export -o audit-events.json
+
+# Export as CSV
+defenseclaw audit export -f csv -o events.csv
+
+# Send events to Splunk (requires splunk config in config.yaml or env var)
+DEFENSECLAW_SPLUNK_HEC_TOKEN=<token> defenseclaw audit export -f splunk -n 500
+```
+
+### Splunk Configuration
+
+Add to `~/.defenseclaw/config.yaml`:
+
+```yaml
+splunk:
+  hec_endpoint: https://your-splunk:8088/services/collector/event
+  hec_token: ""           # or set DEFENSECLAW_SPLUNK_HEC_TOKEN env var
+  index: defenseclaw
+  source: defenseclaw
+  sourcetype: _json
+  verify_tls: false       # set true for production
+  enabled: false          # set true for real-time forwarding
+  batch_size: 50
+  flush_interval_s: 5
+```
+
+When `splunk.enabled: true`, every audit event (scans, blocks, allows, deploys) is
+forwarded to Splunk in real-time via HEC as it happens. The `audit export -f splunk`
+command is for bulk/batch export of historical events.

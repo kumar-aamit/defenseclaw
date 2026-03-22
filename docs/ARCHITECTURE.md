@@ -34,6 +34,7 @@ DefenseClaw Gateway
 +---- Audit ----------------+
 |  SQLite event store       |
 |  JSON/CSV export          |
+|  Splunk HEC (SIEM/SOAR)   |
 +----------------------------+
 ```
 
@@ -43,7 +44,7 @@ DefenseClaw Gateway
 2. **Admission** — Every skill install or MCP registration passes through the admission gate: block list check, then allow list check, then scanner pipeline.
 3. **Enforcement** — Blocked items are quarantined (skills) or disconnected (MCP servers). OpenShell sandbox policy is updated to revoke permissions and network access.
 4. **Runtime** — OpenClaw runs inside an NVIDIA OpenShell sandbox. DefenseClaw writes the sandbox policy; OpenShell enforces it at the kernel level.
-5. **Audit** — Every action (scan, block, allow, quarantine, deploy, stop) is logged to SQLite with timestamp, actor, target, and details.
+5. **Audit** — Every action (scan, block, allow, quarantine, deploy, stop) is logged to SQLite with timestamp, actor, target, and details. Events can be exported as JSON/CSV or forwarded to Splunk via HEC for SIEM/SOAR integration (batch or real-time).
 
 ## Cross-Platform Behavior
 
@@ -56,6 +57,7 @@ DefenseClaw Gateway
 | Network enforcement | Via OpenShell | Not enforced |
 | Audit log | Full | Full |
 | TUI | Full | Full |
+| Splunk SIEM | Full | Full |
 
 ## Key Packages
 
@@ -63,7 +65,7 @@ DefenseClaw Gateway
 |---------|---------------|
 | `internal/scanner` | Scanner interface and wrappers for Python CLI tools |
 | `internal/enforce` | Block/allow lists, quarantine, sandbox policy sync |
-| `internal/audit` | SQLite event store, scan result storage, export |
+| `internal/audit` | SQLite event store, scan result storage, JSON/CSV/Splunk export |
 | `internal/config` | Viper config loader, environment detection |
 | `internal/tui` | Bubbletea four-panel dashboard |
 | `internal/sandbox` | OpenShell CLI wrapper and YAML policy generation |

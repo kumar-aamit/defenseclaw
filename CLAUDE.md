@@ -31,7 +31,7 @@ internal/
   scanner/              Scanner interface + wrappers (shell out to Python CLIs)
   enforce/              Block/allow engine, quarantine, OpenShell policy sync
   tui/                  Bubbletea TUI (four panels: Alerts, Skills, MCP, Status)
-  audit/                SQLite audit store + event logger + export
+  audit/                SQLite audit store + event logger + export + Splunk HEC
   config/               Viper config loader + defaults + environment detection
   inventory/            AIBOM integration
   sandbox/              OpenShell CLI wrapper + policy generation
@@ -95,7 +95,7 @@ All six paths must be tested.
 ## Boundaries
 
 - `defenseclaw-spec.md` — read-only, do not modify
-- No SIEM/SOAR adapters, approval queues, or IAM integration in v1
+- Splunk SIEM adapter available (HEC-based, batch + real-time). No approval queues or IAM integration in v1
 - Never store secrets in code or config — use OS keychain or env vars
 - No `os.Exit()` outside `main()` — return errors up the stack
 - Never rewrite Python scanners in Go — wrap them

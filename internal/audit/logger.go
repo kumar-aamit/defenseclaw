@@ -3,6 +3,7 @@ package audit
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,11 +12,16 @@ import (
 )
 
 type Logger struct {
-	store *Store
+	store    *Store
+	splunk   *SplunkForwarder
 }
 
 func NewLogger(store *Store) *Logger {
 	return &Logger{store: store}
+}
+
+func (l *Logger) SetSplunkForwarder(sf *SplunkForwarder) {
+	l.splunk = sf
 }
 
 func (l *Logger) LogScan(result *scanner.ScanResult) error {
@@ -42,22 +48,50 @@ func (l *Logger) LogScan(result *scanner.ScanResult) error {
 		}
 	}
 
-	return l.store.LogEvent(Event{
+	event := Event{
 		Timestamp: time.Now().UTC(),
 		Action:    "scan",
 		Target:    result.Target,
 		Details: fmt.Sprintf("scanner=%s findings=%d max_severity=%s duration=%s",
 			result.Scanner, len(result.Findings), result.MaxSeverity(), result.Duration),
 		Severity: string(result.MaxSeverity()),
-	})
+	}
+
+	if err := l.store.LogEvent(event); err != nil {
+		return err
+	}
+	l.forwardToSplunk(event)
+	return nil
 }
 
 func (l *Logger) LogAction(action, target, details string) error {
-	return l.store.LogEvent(Event{
+	event := Event{
 		Timestamp: time.Now().UTC(),
 		Action:    action,
 		Target:    target,
 		Details:   details,
 		Severity:  "INFO",
-	})
+	}
+	if err := l.store.LogEvent(event); err != nil {
+		return err
+	}
+	l.forwardToSplunk(event)
+	return nil
+}
+
+func (l *Logger) forwardToSplunk(e Event) {
+	if l.splunk == nil {
+		return
+	}
+	if err := l.splunk.ForwardEvent(e); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: splunk forward: %v\n", err)
+	}
+}
+
+func (l *Logger) Close() {
+	if l.splunk != nil {
+		if err := l.splunk.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: splunk flush on close: %v\n", err)
+		}
+	}
 }

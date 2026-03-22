@@ -155,7 +155,51 @@ defenseclaw alerts -n 50
 defenseclaw stop
 ```
 
-## 10. Next Steps
+## 10. SIEM Integration (Splunk)
+
+DefenseClaw can forward audit events to Splunk for enterprise visibility.
+
+### Batch Export
+
+```bash
+# Export events as JSON
+defenseclaw audit export -f json -o audit.json
+
+# Export as CSV
+defenseclaw audit export -f csv -o audit.csv
+
+# Send to Splunk via HEC
+DEFENSECLAW_SPLUNK_HEC_TOKEN=<your-token> defenseclaw audit export -f splunk -n 500
+```
+
+### Real-Time Forwarding
+
+Add to `~/.defenseclaw/config.yaml`:
+
+```yaml
+splunk:
+  hec_endpoint: https://your-splunk:8088/services/collector/event
+  hec_token: ""
+  index: defenseclaw
+  source: defenseclaw
+  sourcetype: _json
+  verify_tls: false
+  enabled: true
+  batch_size: 50
+  flush_interval_s: 5
+```
+
+Set the token via environment variable (recommended):
+
+```bash
+export DEFENSECLAW_SPLUNK_HEC_TOKEN="your-hec-token"
+```
+
+With `enabled: true`, every scan, block, allow, deploy, and quarantine event is
+streamed to Splunk as it happens.
+
+## 11. Next Steps
 
 - `defenseclaw tui` — interactive terminal dashboard
-- See [CLI Reference](CLI.md) for all commands.
+- See [CLI Reference](CLI.md) for all commands and flags.
+- See [Architecture](ARCHITECTURE.md) for system design details.
