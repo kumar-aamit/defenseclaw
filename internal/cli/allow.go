@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -45,16 +46,21 @@ func init() {
 }
 
 func runAllowSkill(_ *cobra.Command, args []string) error {
-	skillName := args[0]
+	skillArg := args[0]
+	skillName := filepath.Base(skillArg)
 
 	pe := enforce.NewPolicyEngine(auditStore)
 	shell := sandbox.NewWithFallback(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir, cfg.PolicyDir)
 	se := enforce.NewSkillEnforcer(cfg.QuarantineDir, shell)
 
 	if !skipRescan {
-		scanTarget := skillName
+		scanTarget := skillArg
 		if se.IsQuarantined(skillName) {
 			scanTarget = cfg.QuarantineDir + "/skills/" + skillName
+		} else if !filepath.IsAbs(scanTarget) {
+			if resolved := resolveInstalledSkillPath(skillName); resolved != "" {
+				scanTarget = resolved
+			}
 		}
 
 		fmt.Printf("[allow] Re-scanning %q before allowing...\n", scanTarget)
@@ -91,6 +97,11 @@ func runAllowSkill(_ *cobra.Command, args []string) error {
 
 	if err := pe.Allow("skill", skillName, reason); err != nil {
 		return fmt.Errorf("allow skill: %w", err)
+	}
+	_ = pe.ClearQuarantine("skill", skillName)
+	_ = pe.Enable("skill", skillName)
+	if resolved := resolveInstalledSkillPath(skillName); resolved != "" {
+		pe.SetSourcePath("skill", skillName, resolved)
 	}
 	fmt.Printf("[allow] Skill %q added to allow list\n", skillName)
 

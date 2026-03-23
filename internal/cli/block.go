@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -42,7 +43,14 @@ func init() {
 }
 
 func runBlockSkill(_ *cobra.Command, args []string) error {
-	skillName := args[0]
+	skillArg := args[0]
+	skillName := filepath.Base(skillArg)
+	skillPath := skillArg
+	if !filepath.IsAbs(skillPath) {
+		if resolved := resolveInstalledSkillPath(skillName); resolved != "" {
+			skillPath = resolved
+		}
+	}
 
 	pe := enforce.NewPolicyEngine(auditStore)
 	blocked, err := pe.IsBlocked("skill", skillName)
@@ -65,14 +73,18 @@ func runBlockSkill(_ *cobra.Command, args []string) error {
 	if err := pe.Block("skill", skillName, reason); err != nil {
 		return fmt.Errorf("block skill: %w", err)
 	}
+	if filepath.IsAbs(skillPath) {
+		pe.SetSourcePath("skill", skillName, skillPath)
+	}
 	fmt.Printf("[block] Skill %q added to block list\n", skillName)
 
-	dest, qErr := se.Quarantine(skillName)
+	dest, qErr := se.Quarantine(skillPath)
 	if qErr != nil {
 		fmt.Printf("[block] Warning: could not quarantine skill files: %v\n", qErr)
 		fmt.Printf("        Skill is blocked in the database but files were not moved.\n")
 	} else {
 		fmt.Printf("[block] Skill quarantined to %s\n", dest)
+		_ = pe.Quarantine("skill", skillName, reason)
 	}
 
 	pErr := se.UpdateSandboxPolicy(skillName, true)

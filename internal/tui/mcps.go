@@ -10,10 +10,11 @@ import (
 )
 
 type mcpItem struct {
-	URL    string
-	Status string
-	Reason string
-	Time   string
+	URL     string
+	Status  string
+	Actions string
+	Reason  string
+	Time    string
 }
 
 type MCPsPanel struct {
@@ -36,31 +37,24 @@ func (p *MCPsPanel) Refresh() {
 
 	p.items = nil
 
-	blocked, err := p.store.ListBlockedByType("mcp")
+	entries, err := p.store.ListActionsByType("mcp")
 	if err != nil {
 		p.message = fmt.Sprintf("Error: %v", err)
 		return
 	}
-	for _, b := range blocked {
+	for _, e := range entries {
+		status := "active"
+		if e.Actions.Install == "block" {
+			status = "blocked"
+		} else if e.Actions.Install == "allow" {
+			status = "allowed"
+		}
 		p.items = append(p.items, mcpItem{
-			URL:    b.TargetName,
-			Status: "blocked",
-			Reason: b.Reason,
-			Time:   b.CreatedAt.Format("2006-01-02 15:04"),
-		})
-	}
-
-	allowed, err := p.store.ListAllowedByType("mcp")
-	if err != nil {
-		p.message = fmt.Sprintf("Error: %v", err)
-		return
-	}
-	for _, a := range allowed {
-		p.items = append(p.items, mcpItem{
-			URL:    a.TargetName,
-			Status: "allowed",
-			Reason: a.Reason,
-			Time:   a.CreatedAt.Format("2006-01-02 15:04"),
+			URL:     e.TargetName,
+			Status:  status,
+			Actions: e.Actions.Summary(),
+			Reason:  e.Reason,
+			Time:    e.UpdatedAt.Format("2006-01-02 15:04"),
 		})
 	}
 
@@ -91,13 +85,11 @@ func (p *MCPsPanel) ToggleBlock() string {
 		return ""
 	}
 	if sel.Status == "blocked" {
-		_ = p.store.RemoveBlock("mcp", sel.URL)
-		_ = p.store.AddAllow("mcp", sel.URL, "unblocked from TUI")
+		_ = p.store.SetActionField("mcp", sel.URL, "install", "allow", "unblocked from TUI")
 		p.Refresh()
 		return fmt.Sprintf("Allowed MCP: %s", sel.URL)
 	}
-	_ = p.store.RemoveAllow("mcp", sel.URL)
-	_ = p.store.AddBlock("mcp", sel.URL, "blocked from TUI")
+	_ = p.store.SetActionField("mcp", sel.URL, "install", "block", "blocked from TUI")
 	p.Refresh()
 	return fmt.Sprintf("Blocked MCP: %s", sel.URL)
 }
@@ -118,11 +110,11 @@ func (p *MCPsPanel) View() string {
 		return p.message
 	}
 	if len(p.items) == 0 {
-		return StyleInfo.Render("  No MCP servers in block/allow lists. Use 'defenseclaw block mcp' or 'defenseclaw allow mcp' to add.")
+		return StyleInfo.Render("  No MCP servers with enforcement actions. Use 'defenseclaw block mcp' or 'defenseclaw allow mcp' to add.")
 	}
 
 	var b strings.Builder
-	header := fmt.Sprintf("  %-10s %-50s %-25s %-16s", "STATUS", "URL", "REASON", "SINCE")
+	header := fmt.Sprintf("  %-10s %-40s %-20s %-20s %-16s", "STATUS", "URL", "ACTIONS", "REASON", "SINCE")
 	b.WriteString(HeaderStyle.Render(header))
 	b.WriteString("\n")
 
@@ -144,15 +136,19 @@ func (p *MCPsPanel) View() string {
 		item := p.items[i]
 		status := StatusStyle(item.Status).Render(fmt.Sprintf("%-10s", strings.ToUpper(item.Status)))
 		url := item.URL
-		if len(url) > 50 {
-			url = url[:47] + "..."
+		if len(url) > 40 {
+			url = url[:37] + "..."
+		}
+		actions := item.Actions
+		if len(actions) > 20 {
+			actions = actions[:17] + "..."
 		}
 		reason := item.Reason
-		if len(reason) > 25 {
-			reason = reason[:22] + "..."
+		if len(reason) > 20 {
+			reason = reason[:17] + "..."
 		}
 
-		line := fmt.Sprintf("  %s %-50s %-25s %-16s", status, url, reason, item.Time)
+		line := fmt.Sprintf("  %s %-40s %-20s %-20s %-16s", status, url, actions, reason, item.Time)
 
 		if i == p.cursor {
 			line = SelectedStyle.Width(p.width).Render(line)

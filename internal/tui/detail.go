@@ -41,22 +41,24 @@ func (d *DetailModal) ShowAlert(sev, action, target, details, ts string) {
 	d.visible = true
 }
 
-func (d *DetailModal) ShowSkill(name, status, reason, since string) {
+func (d *DetailModal) ShowSkill(name, status, actions, reason, since string) {
 	d.title = fmt.Sprintf("Skill: %s", name)
 	d.fields = []detailField{
 		{"Name", name},
 		{"Status", status},
+		{"Actions", actions},
 		{"Reason", reason},
 		{"Since", since},
 	}
 	d.visible = true
 }
 
-func (d *DetailModal) ShowMCP(url, status, reason, since string) {
+func (d *DetailModal) ShowMCP(url, status, actions, reason, since string) {
 	d.title = fmt.Sprintf("MCP: %s", url)
 	d.fields = []detailField{
 		{"URL", url},
 		{"Status", status},
+		{"Actions", actions},
 		{"Reason", reason},
 		{"Since", since},
 	}

@@ -55,6 +55,7 @@ func setupTestEnv(t *testing.T) (cfg *config.Config, store *audit.Store, logger 
 			DebounceMs: 100,
 			AutoBlock:  true,
 		},
+		SkillActions: config.DefaultSkillActions(),
 	}
 
 	return cfg, store, logger, skillDir, mcpDir
@@ -92,7 +93,7 @@ func TestAdmission_BlockedSkill(t *testing.T) {
 	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
 	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
 
-	if err := store.AddBlock("skill", "evil-skill", "known malicious"); err != nil {
+	if err := store.SetActionField("skill", "evil-skill", "install", "block", "known malicious"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -115,7 +116,7 @@ func TestAdmission_AllowedSkill(t *testing.T) {
 	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
 	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
 
-	if err := store.AddAllow("skill", "trusted-skill", "pre-approved"); err != nil {
+	if err := store.SetActionField("skill", "trusted-skill", "install", "allow", "pre-approved"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -138,7 +139,7 @@ func TestAdmission_BlockedMCP(t *testing.T) {
 	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
 	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
 
-	if err := store.AddBlock("mcp", "rogue-server", "compromised"); err != nil {
+	if err := store.SetActionField("mcp", "rogue-server", "install", "block", "compromised"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -161,7 +162,7 @@ func TestAdmission_AllowedMCP(t *testing.T) {
 	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
 	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
 
-	if err := store.AddAllow("mcp", "approved-server", "vetted"); err != nil {
+	if err := store.SetActionField("mcp", "approved-server", "install", "allow", "vetted"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -190,11 +191,9 @@ func TestAdmission_ScanError_NoScanner(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Scanner binary won't exist, so scan will error
 	evt := InstallEvent{Type: InstallSkill, Name: "unknown-skill", Path: skillPath, Timestamp: time.Now()}
 	result := w.runAdmission(context.Background(), evt)
 
-	// Either ScanError (binary missing) or the scan completes — both are valid
 	if result.Verdict != VerdictScanError && result.Verdict != VerdictClean {
 		t.Logf("verdict=%s reason=%s", result.Verdict, result.Reason)
 	}
@@ -204,7 +203,7 @@ func TestWatcher_DetectsNewFile(t *testing.T) {
 	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
 	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
 
-	if err := store.AddBlock("mcp", "detected-server", "test"); err != nil {
+	if err := store.SetActionField("mcp", "detected-server", "install", "block", "test"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -225,16 +224,13 @@ func TestWatcher_DetectsNewFile(t *testing.T) {
 		errCh <- w.Run(ctx)
 	}()
 
-	// Give the watcher time to start
 	time.Sleep(200 * time.Millisecond)
 
-	// Create a file in the MCP dir to trigger detection
 	filePath := filepath.Join(mcpDir, "detected-server")
 	if err := os.WriteFile(filePath, []byte(`{"name":"test"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	// Wait for debounce + processing
 	time.Sleep(time.Duration(cfg.Watch.DebounceMs*3) * time.Millisecond)
 
 	cancel()
@@ -265,7 +261,7 @@ func TestWatcher_DetectsNewDirectory(t *testing.T) {
 	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
 	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
 
-	if err := store.AddAllow("skill", "new-skill", "pre-approved"); err != nil {
+	if err := store.SetActionField("skill", "new-skill", "install", "allow", "pre-approved"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -288,7 +284,6 @@ func TestWatcher_DetectsNewDirectory(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	// Create a directory in the skill dir to trigger detection
 	if err := os.MkdirAll(filepath.Join(skillDir, "new-skill"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -323,11 +318,9 @@ func TestAdmission_GatePrecedence_BlockBeatsAllow(t *testing.T) {
 	cfg, store, logger, skillDir, mcpDir := setupTestEnv(t)
 	shell := sandbox.New(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir)
 
-	// Add to both lists — block should take priority
-	if err := store.AddBlock("skill", "conflict-skill", "security"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.AddAllow("skill", "conflict-skill", "override attempt"); err != nil {
+	// With the unified table, setting install to "block" after "allow" replaces it.
+	// The block check runs first in the admission gate, so block takes priority.
+	if err := store.SetActionField("skill", "conflict-skill", "install", "block", "security"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -343,5 +336,55 @@ func TestAdmission_GatePrecedence_BlockBeatsAllow(t *testing.T) {
 
 	if result.Verdict != VerdictBlocked {
 		t.Errorf("expected block to take precedence, got verdict %q", result.Verdict)
+	}
+}
+
+func TestActionState_IndependentDimensions(t *testing.T) {
+	_, store, _, _, _ := setupTestEnv(t)
+
+	// Set install to block
+	if err := store.SetActionField("skill", "multi-action", "install", "block", "blocked"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set file to quarantine (should not affect install)
+	if err := store.SetActionField("skill", "multi-action", "file", "quarantine", "quarantined"); err != nil {
+		t.Fatal(err)
+	}
+
+	entry, err := store.GetAction("skill", "multi-action")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry == nil {
+		t.Fatal("expected action entry, got nil")
+	}
+	if entry.Actions.Install != "block" {
+		t.Errorf("expected install=block, got %q", entry.Actions.Install)
+	}
+	if entry.Actions.File != "quarantine" {
+		t.Errorf("expected file=quarantine, got %q", entry.Actions.File)
+	}
+}
+
+func TestActionState_InstallOverwrite(t *testing.T) {
+	_, store, _, _, _ := setupTestEnv(t)
+
+	if err := store.SetActionField("skill", "flip-skill", "install", "block", "blocked"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetActionField("skill", "flip-skill", "install", "allow", "now allowed"); err != nil {
+		t.Fatal(err)
+	}
+
+	entry, err := store.GetAction("skill", "flip-skill")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry == nil {
+		t.Fatal("expected action entry, got nil")
+	}
+	if entry.Actions.Install != "allow" {
+		t.Errorf("expected install=allow after overwrite, got %q", entry.Actions.Install)
 	}
 }

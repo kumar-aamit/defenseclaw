@@ -10,10 +10,11 @@ import (
 )
 
 type skillItem struct {
-	Name   string
-	Status string
-	Reason string
-	Time   string
+	Name    string
+	Status  string
+	Actions string
+	Reason  string
+	Time    string
 }
 
 type SkillsPanel struct {
@@ -36,31 +37,24 @@ func (p *SkillsPanel) Refresh() {
 
 	p.items = nil
 
-	blocked, err := p.store.ListBlockedByType("skill")
+	entries, err := p.store.ListActionsByType("skill")
 	if err != nil {
 		p.message = fmt.Sprintf("Error: %v", err)
 		return
 	}
-	for _, b := range blocked {
+	for _, e := range entries {
+		status := "active"
+		if e.Actions.Install == "block" {
+			status = "blocked"
+		} else if e.Actions.Install == "allow" {
+			status = "allowed"
+		}
 		p.items = append(p.items, skillItem{
-			Name:   b.TargetName,
-			Status: "blocked",
-			Reason: b.Reason,
-			Time:   b.CreatedAt.Format("2006-01-02 15:04"),
-		})
-	}
-
-	allowed, err := p.store.ListAllowedByType("skill")
-	if err != nil {
-		p.message = fmt.Sprintf("Error: %v", err)
-		return
-	}
-	for _, a := range allowed {
-		p.items = append(p.items, skillItem{
-			Name:   a.TargetName,
-			Status: "allowed",
-			Reason: a.Reason,
-			Time:   a.CreatedAt.Format("2006-01-02 15:04"),
+			Name:    e.TargetName,
+			Status:  status,
+			Actions: e.Actions.Summary(),
+			Reason:  e.Reason,
+			Time:    e.UpdatedAt.Format("2006-01-02 15:04"),
 		})
 	}
 
@@ -91,18 +85,16 @@ func (p *SkillsPanel) ToggleBlock() string {
 		return ""
 	}
 	if sel.Status == "blocked" {
-		_ = p.store.RemoveBlock("skill", sel.Name)
-		_ = p.store.AddAllow("skill", sel.Name, "unblocked from TUI")
+		_ = p.store.SetActionField("skill", sel.Name, "install", "allow", "unblocked from TUI")
 		p.Refresh()
 		return fmt.Sprintf("Allowed skill: %s", sel.Name)
 	}
-	_ = p.store.RemoveAllow("skill", sel.Name)
-	_ = p.store.AddBlock("skill", sel.Name, "blocked from TUI")
+	_ = p.store.SetActionField("skill", sel.Name, "install", "block", "blocked from TUI")
 	p.Refresh()
 	return fmt.Sprintf("Blocked skill: %s", sel.Name)
 }
 
-func (p *SkillsPanel) Count() int                 { return len(p.items) }
+func (p *SkillsPanel) Count() int { return len(p.items) }
 func (p *SkillsPanel) BlockedCount() int {
 	n := 0
 	for _, i := range p.items {
@@ -118,11 +110,11 @@ func (p *SkillsPanel) View() string {
 		return p.message
 	}
 	if len(p.items) == 0 {
-		return StyleInfo.Render("  No skills in block/allow lists. Use 'defenseclaw block skill' or 'defenseclaw allow skill' to add.")
+		return StyleInfo.Render("  No skills with enforcement actions. Use 'defenseclaw block skill' or 'defenseclaw allow skill' to add.")
 	}
 
 	var b strings.Builder
-	header := fmt.Sprintf("  %-10s %-40s %-25s %-16s", "STATUS", "NAME", "REASON", "SINCE")
+	header := fmt.Sprintf("  %-10s %-30s %-20s %-20s %-16s", "STATUS", "NAME", "ACTIONS", "REASON", "SINCE")
 	b.WriteString(HeaderStyle.Render(header))
 	b.WriteString("\n")
 
@@ -144,15 +136,19 @@ func (p *SkillsPanel) View() string {
 		item := p.items[i]
 		status := StatusStyle(item.Status).Render(fmt.Sprintf("%-10s", strings.ToUpper(item.Status)))
 		name := item.Name
-		if len(name) > 40 {
-			name = name[:37] + "..."
+		if len(name) > 30 {
+			name = name[:27] + "..."
+		}
+		actions := item.Actions
+		if len(actions) > 20 {
+			actions = actions[:17] + "..."
 		}
 		reason := item.Reason
-		if len(reason) > 25 {
-			reason = reason[:22] + "..."
+		if len(reason) > 20 {
+			reason = reason[:17] + "..."
 		}
 
-		line := fmt.Sprintf("  %s %-40s %-25s %-16s", status, name, reason, item.Time)
+		line := fmt.Sprintf("  %s %-30s %-20s %-20s %-16s", status, name, actions, reason, item.Time)
 
 		if i == p.cursor {
 			line = SelectedStyle.Width(p.width).Render(line)

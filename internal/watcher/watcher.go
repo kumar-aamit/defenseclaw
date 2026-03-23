@@ -267,6 +267,16 @@ func (w *InstallWatcher) runAdmission(ctx context.Context, evt InstallEvent) Adm
 		if w.cfg.Watch.AutoBlock {
 			blockReason := fmt.Sprintf("auto-block: watch detected %s findings (scanner=%s)", maxSev, s.Name())
 			_ = pe.Block(targetType, evt.Name, blockReason)
+			pe.SetSourcePath(targetType, evt.Name, evt.Path)
+
+			action := w.cfg.SkillActions.ForSeverity(string(maxSev))
+			if action.File == config.FileActionQuarantine {
+				_ = pe.Quarantine(targetType, evt.Name, blockReason)
+			}
+			if action.Runtime == config.RuntimeDisable {
+				_ = pe.Disable(targetType, evt.Name, blockReason)
+			}
+
 			w.enforceBlock(evt)
 		}
 		return AdmissionResult{Event: evt, Verdict: VerdictRejected, Reason: reason}

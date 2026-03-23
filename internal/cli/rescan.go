@@ -32,8 +32,7 @@ func runRescan(cmd *cobra.Command, _ []string) error {
 	fmt.Println("Re-scanning all known targets...")
 	fmt.Println()
 
-	blocked, _ := pe.ListBlocked()
-	allowed, _ := pe.ListAllowed()
+	allActions, _ := pe.ListAll()
 
 	type target struct {
 		name       string
@@ -42,18 +41,11 @@ func runRescan(cmd *cobra.Command, _ []string) error {
 
 	seen := make(map[string]bool)
 	var targets []target
-	for _, b := range blocked {
-		key := b.TargetType + ":" + b.TargetName
+	for _, entry := range allActions {
+		key := entry.TargetType + ":" + entry.TargetName
 		if !seen[key] {
 			seen[key] = true
-			targets = append(targets, target{name: b.TargetName, targetType: b.TargetType})
-		}
-	}
-	for _, a := range allowed {
-		key := a.TargetType + ":" + a.TargetName
-		if !seen[key] {
-			seen[key] = true
-			targets = append(targets, target{name: a.TargetName, targetType: a.TargetType})
+			targets = append(targets, target{name: entry.TargetName, targetType: entry.TargetType})
 		}
 	}
 

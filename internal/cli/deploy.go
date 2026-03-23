@@ -250,15 +250,15 @@ func generateSandboxPolicy(shell *sandbox.OpenShell) error {
 	}
 
 	if auditStore != nil {
-		blockedMCPs, _ := auditStore.ListBlockedByType("mcp")
+		blockedMCPs, _ := auditStore.ListByActionAndType("install", "block", "mcp")
 		for _, b := range blockedMCPs {
 			policy.DenyEndpoint(b.TargetName)
 		}
-		blockedSkills, _ := auditStore.ListBlockedByType("skill")
+		blockedSkills, _ := auditStore.ListByActionAndType("install", "block", "skill")
 		for _, b := range blockedSkills {
 			policy.DenySkill(b.TargetName)
 		}
-		allowedSkills, _ := auditStore.ListAllowedByType("skill")
+		allowedSkills, _ := auditStore.ListByActionAndType("install", "allow", "skill")
 		for _, a := range allowedSkills {
 			policy.AllowSkill(a.TargetName)
 		}

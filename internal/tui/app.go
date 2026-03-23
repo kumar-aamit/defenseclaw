@@ -224,11 +224,11 @@ func (m *Model) showDetail() {
 		}
 	case tabSkills:
 		if sel := m.skills.Selected(); sel != nil {
-			m.detail.ShowSkill(sel.Name, sel.Status, sel.Reason, sel.Time)
+			m.detail.ShowSkill(sel.Name, sel.Status, sel.Actions, sel.Reason, sel.Time)
 		}
 	case tabMCPs:
 		if sel := m.mcps.Selected(); sel != nil {
-			m.detail.ShowMCP(sel.URL, sel.Status, sel.Reason, sel.Time)
+			m.detail.ShowMCP(sel.URL, sel.Status, sel.Actions, sel.Reason, sel.Time)
 		}
 	}
 }

@@ -2,7 +2,9 @@ package audit
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,20 +21,46 @@ type Event struct {
 	Severity  string    `json:"severity"`
 }
 
-type BlockEntry struct {
-	ID         string    `json:"id"`
-	TargetType string    `json:"target_type"`
-	TargetName string    `json:"target_name"`
-	Reason     string    `json:"reason"`
-	CreatedAt  time.Time `json:"created_at"`
+// ActionState tracks enforcement state across three independent dimensions.
+type ActionState struct {
+	File    string `json:"file,omitempty"`    // "quarantine" or "" (none)
+	Runtime string `json:"runtime,omitempty"` // "disable" or "" (enable)
+	Install string `json:"install,omitempty"` // "block", "allow", or "" (none)
 }
 
-type AllowEntry struct {
-	ID         string    `json:"id"`
-	TargetType string    `json:"target_type"`
-	TargetName string    `json:"target_name"`
-	Reason     string    `json:"reason"`
-	CreatedAt  time.Time `json:"created_at"`
+func (a ActionState) IsEmpty() bool {
+	return a.File == "" && a.Runtime == "" && a.Install == ""
+}
+
+func (a ActionState) Summary() string {
+	var parts []string
+	if a.Install == "block" {
+		parts = append(parts, "blocked")
+	}
+	if a.Install == "allow" {
+		parts = append(parts, "allowed")
+	}
+	if a.File == "quarantine" {
+		parts = append(parts, "quarantined")
+	}
+	if a.Runtime == "disable" {
+		parts = append(parts, "disabled")
+	}
+	if len(parts) == 0 {
+		return "-"
+	}
+	return strings.Join(parts, ", ")
+}
+
+// ActionEntry is the unified record for all enforcement actions on a target.
+type ActionEntry struct {
+	ID         string      `json:"id"`
+	TargetType string      `json:"target_type"`
+	TargetName string      `json:"target_name"`
+	SourcePath string      `json:"source_path,omitempty"`
+	Actions    ActionState `json:"actions"`
+	Reason     string      `json:"reason"`
+	UpdatedAt  time.Time   `json:"updated_at"`
 }
 
 type Store struct {
@@ -89,20 +117,14 @@ func (s *Store) Init() error {
 		FOREIGN KEY (scan_id) REFERENCES scan_results(id)
 	);
 
-	CREATE TABLE IF NOT EXISTS block_list (
+	CREATE TABLE IF NOT EXISTS actions (
 		id TEXT PRIMARY KEY,
 		target_type TEXT NOT NULL,
 		target_name TEXT NOT NULL,
+		source_path TEXT,
+		actions_json TEXT NOT NULL DEFAULT '{}',
 		reason TEXT,
-		created_at DATETIME NOT NULL
-	);
-
-	CREATE TABLE IF NOT EXISTS allow_list (
-		id TEXT PRIMARY KEY,
-		target_type TEXT NOT NULL,
-		target_name TEXT NOT NULL,
-		reason TEXT,
-		created_at DATETIME NOT NULL
+		updated_at DATETIME NOT NULL
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_events(timestamp);
@@ -110,12 +132,49 @@ func (s *Store) Init() error {
 	CREATE INDEX IF NOT EXISTS idx_scan_scanner ON scan_results(scanner);
 	CREATE INDEX IF NOT EXISTS idx_finding_severity ON findings(severity);
 	CREATE INDEX IF NOT EXISTS idx_finding_scan ON findings(scan_id);
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_block_type_name ON block_list(target_type, target_name);
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_allow_type_name ON allow_list(target_type, target_name);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_actions_type_name ON actions(target_type, target_name);
 	`
 
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("audit: init schema: %w", err)
+	}
+
+	if err := s.migrateOldLists(); err != nil {
+		return fmt.Errorf("audit: migrate old lists: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Store) migrateOldLists() error {
+	var blockCount, allowCount int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='block_list'`).Scan(&blockCount); err != nil {
+		return err
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='allow_list'`).Scan(&allowCount); err != nil {
+		return err
+	}
+	if blockCount == 0 && allowCount == 0 {
+		return nil
+	}
+
+	if blockCount > 0 {
+		if _, err := s.db.Exec(`INSERT OR REPLACE INTO actions (id, target_type, target_name, source_path, actions_json, reason, updated_at)
+			SELECT id, target_type, target_name, NULL, '{"install":"block"}', reason, created_at FROM block_list`); err != nil {
+			return fmt.Errorf("migrate block_list: %w", err)
+		}
+	}
+	if allowCount > 0 {
+		if _, err := s.db.Exec(`INSERT OR REPLACE INTO actions (id, target_type, target_name, source_path, actions_json, reason, updated_at)
+			SELECT id, target_type, target_name, NULL, '{"install":"allow"}', reason, created_at FROM allow_list`); err != nil {
+			return fmt.Errorf("migrate allow_list: %w", err)
+		}
+	}
+	if _, err := s.db.Exec(`DROP TABLE IF EXISTS block_list`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`DROP TABLE IF EXISTS allow_list`); err != nil {
+		return err
 	}
 	return nil
 }
@@ -197,126 +256,244 @@ func (s *Store) ListEvents(limit int) ([]Event, error) {
 	return events, rows.Err()
 }
 
-// --- Block List ---
+// --- Actions ---
 
-func (s *Store) AddBlock(targetType, targetName, reason string) error {
+// SetAction upserts the full action state for a target.
+func (s *Store) SetAction(targetType, targetName, sourcePath string, state ActionState, reason string) error {
+	actionsJSON, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("audit: marshal actions: %w", err)
+	}
 	id := uuid.New().String()
-	_, err := s.db.Exec(
-		`INSERT OR REPLACE INTO block_list (id, target_type, target_name, reason, created_at)
-		 VALUES (?, ?, ?, ?, ?)`,
-		id, targetType, targetName, reason, time.Now().UTC(),
+	now := time.Now().UTC()
+	_, err = s.db.Exec(
+		`INSERT INTO actions (id, target_type, target_name, source_path, actions_json, reason, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(target_type, target_name) DO UPDATE SET
+		   actions_json = excluded.actions_json,
+		   reason = excluded.reason,
+		   updated_at = excluded.updated_at,
+		   source_path = COALESCE(excluded.source_path, source_path)`,
+		id, targetType, targetName, nullStr(sourcePath), string(actionsJSON), reason, now,
 	)
 	if err != nil {
-		return fmt.Errorf("audit: add block: %w", err)
+		return fmt.Errorf("audit: set action: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) RemoveBlock(targetType, targetName string) error {
+// SetActionField updates a single action dimension without touching others.
+func (s *Store) SetActionField(targetType, targetName, field, value, reason string) error {
+	if err := validateActionFieldAndValue(field, value); err != nil {
+		return err
+	}
+	id := uuid.New().String()
+	now := time.Now().UTC()
+	path := "$." + field
+	initJSON := "{}"
+	switch field {
+	case "install":
+		initJSON = fmt.Sprintf(`{"install":"%s"}`, value)
+	case "file":
+		initJSON = fmt.Sprintf(`{"file":"%s"}`, value)
+	case "runtime":
+		initJSON = fmt.Sprintf(`{"runtime":"%s"}`, value)
+	}
+	query :=
+		`INSERT INTO actions (id, target_type, target_name, source_path, actions_json, reason, updated_at)
+		 VALUES (?, ?, ?, NULL, ?, ?, ?)
+		 ON CONFLICT(target_type, target_name) DO UPDATE SET
+		   actions_json = json_set(actions_json, ?, ?),
+		   reason = excluded.reason,
+		   updated_at = excluded.updated_at`
+	_, err := s.db.Exec(query, id, targetType, targetName, initJSON, reason, now, path, value)
+	if err != nil {
+		return fmt.Errorf("audit: set action field %s: %w", field, err)
+	}
+	return nil
+}
+
+// SetSourcePath updates just the source_path for an existing action row.
+func (s *Store) SetSourcePath(targetType, targetName, path string) error {
 	_, err := s.db.Exec(
-		`DELETE FROM block_list WHERE target_type = ? AND target_name = ?`,
+		`UPDATE actions SET source_path = ? WHERE target_type = ? AND target_name = ?`,
+		path, targetType, targetName,
+	)
+	if err != nil {
+		return fmt.Errorf("audit: set source path: %w", err)
+	}
+	return nil
+}
+
+// ClearActionField removes a single dimension from the actions JSON.
+// Deletes the row if all dimensions are empty afterward.
+func (s *Store) ClearActionField(targetType, targetName, field string) error {
+	if err := validateActionFieldAndValue(field, ""); err != nil {
+		return err
+	}
+	path := "$." + field
+	_, err := s.db.Exec(
+		`UPDATE actions SET actions_json = json_remove(actions_json, ?), updated_at = ?
+		 WHERE target_type = ? AND target_name = ?`,
+		path, time.Now().UTC(), targetType, targetName,
+	)
+	if err != nil {
+		return fmt.Errorf("audit: clear action field %s: %w", field, err)
+	}
+	// Clean up rows with no active actions
+	_, _ = s.db.Exec(
+		`DELETE FROM actions WHERE target_type = ? AND target_name = ? AND actions_json IN ('{}', 'null', '')`,
+		targetType, targetName,
+	)
+	return nil
+}
+
+// RemoveAction deletes the entire action row for a target.
+func (s *Store) RemoveAction(targetType, targetName string) error {
+	_, err := s.db.Exec(
+		`DELETE FROM actions WHERE target_type = ? AND target_name = ?`,
 		targetType, targetName,
 	)
 	if err != nil {
-		return fmt.Errorf("audit: remove block: %w", err)
+		return fmt.Errorf("audit: remove action: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) IsBlocked(targetType, targetName string) (bool, error) {
-	var count int
+// GetAction returns the full action entry for a target, or nil if none exists.
+func (s *Store) GetAction(targetType, targetName string) (*ActionEntry, error) {
+	var e ActionEntry
+	var sourcePath, reason, actionsJSON sql.NullString
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM block_list WHERE target_type = ? AND target_name = ?`,
+		`SELECT id, target_type, target_name, source_path, actions_json, reason, updated_at
+		 FROM actions WHERE target_type = ? AND target_name = ?`,
 		targetType, targetName,
-	).Scan(&count)
+	).Scan(&e.ID, &e.TargetType, &e.TargetName, &sourcePath, &actionsJSON, &reason, &e.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
 	if err != nil {
-		return false, fmt.Errorf("audit: check block: %w", err)
+		return nil, fmt.Errorf("audit: get action: %w", err)
+	}
+	e.SourcePath = sourcePath.String
+	e.Reason = reason.String
+	if actionsJSON.String != "" {
+		_ = json.Unmarshal([]byte(actionsJSON.String), &e.Actions)
+	}
+	return &e, nil
+}
+
+// HasAction checks if a target has a specific field set to a specific value.
+func (s *Store) HasAction(targetType, targetName, field, value string) (bool, error) {
+	if err := validateActionFieldAndValue(field, value); err != nil {
+		return false, err
+	}
+	var count int
+	query := fmt.Sprintf(
+		`SELECT COUNT(*) FROM actions WHERE target_type = ? AND target_name = ? AND json_extract(actions_json, '$.%s') = ?`,
+		field)
+	err := s.db.QueryRow(query, targetType, targetName, value).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("audit: has action: %w", err)
 	}
 	return count > 0, nil
 }
 
-func (s *Store) ListBlocked() ([]BlockEntry, error) {
-	rows, err := s.db.Query(
-		`SELECT id, target_type, target_name, reason, created_at
-		 FROM block_list ORDER BY created_at DESC`,
-	)
+// ListByAction returns all entries where a given field has a given value.
+func (s *Store) ListByAction(field, value string) ([]ActionEntry, error) {
+	if err := validateActionFieldAndValue(field, value); err != nil {
+		return nil, err
+	}
+	query := fmt.Sprintf(
+		`SELECT id, target_type, target_name, source_path, actions_json, reason, updated_at
+		 FROM actions WHERE json_extract(actions_json, '$.%s') = ?
+		 ORDER BY updated_at DESC`, field)
+	return s.queryActions(query, value)
+}
+
+// ListByActionAndType filters by both action field/value and target_type.
+func (s *Store) ListByActionAndType(field, value, targetType string) ([]ActionEntry, error) {
+	if err := validateActionFieldAndValue(field, value); err != nil {
+		return nil, err
+	}
+	query := fmt.Sprintf(
+		`SELECT id, target_type, target_name, source_path, actions_json, reason, updated_at
+		 FROM actions WHERE json_extract(actions_json, '$.%s') = ? AND target_type = ?
+		 ORDER BY updated_at DESC`, field)
+	return s.queryActions(query, value, targetType)
+}
+
+// ListActionsByType returns all action entries for a given target type.
+func (s *Store) ListActionsByType(targetType string) ([]ActionEntry, error) {
+	return s.queryActions(
+		`SELECT id, target_type, target_name, source_path, actions_json, reason, updated_at
+		 FROM actions WHERE target_type = ? ORDER BY updated_at DESC`, targetType)
+}
+
+// ListAllActions returns every action entry.
+func (s *Store) ListAllActions() ([]ActionEntry, error) {
+	return s.queryActions(
+		`SELECT id, target_type, target_name, source_path, actions_json, reason, updated_at
+		 FROM actions ORDER BY updated_at DESC`)
+}
+
+func (s *Store) queryActions(query string, args ...any) ([]ActionEntry, error) {
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("audit: list blocked: %w", err)
+		return nil, fmt.Errorf("audit: query actions: %w", err)
 	}
 	defer rows.Close()
 
-	var entries []BlockEntry
+	var entries []ActionEntry
 	for rows.Next() {
-		var e BlockEntry
-		var reason sql.NullString
-		if err := rows.Scan(&e.ID, &e.TargetType, &e.TargetName, &reason, &e.CreatedAt); err != nil {
-			return nil, fmt.Errorf("audit: scan block row: %w", err)
+		var e ActionEntry
+		var sourcePath, reason, actionsJSON sql.NullString
+		if err := rows.Scan(&e.ID, &e.TargetType, &e.TargetName, &sourcePath, &actionsJSON, &reason, &e.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("audit: scan action row: %w", err)
 		}
+		e.SourcePath = sourcePath.String
 		e.Reason = reason.String
+		if actionsJSON.String != "" {
+			_ = json.Unmarshal([]byte(actionsJSON.String), &e.Actions)
+		}
 		entries = append(entries, e)
 	}
 	return entries, rows.Err()
 }
 
-// --- Allow List ---
-
-func (s *Store) AddAllow(targetType, targetName, reason string) error {
-	id := uuid.New().String()
-	_, err := s.db.Exec(
-		`INSERT OR REPLACE INTO allow_list (id, target_type, target_name, reason, created_at)
-		 VALUES (?, ?, ?, ?, ?)`,
-		id, targetType, targetName, reason, time.Now().UTC(),
-	)
-	if err != nil {
-		return fmt.Errorf("audit: add allow: %w", err)
+func nullStr(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
 	}
-	return nil
+	return sql.NullString{String: s, Valid: true}
 }
 
-func (s *Store) RemoveAllow(targetType, targetName string) error {
-	_, err := s.db.Exec(
-		`DELETE FROM allow_list WHERE target_type = ? AND target_name = ?`,
-		targetType, targetName,
-	)
-	if err != nil {
-		return fmt.Errorf("audit: remove allow: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) IsAllowed(targetType, targetName string) (bool, error) {
-	var count int
-	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM allow_list WHERE target_type = ? AND target_name = ?`,
-		targetType, targetName,
-	).Scan(&count)
-	if err != nil {
-		return false, fmt.Errorf("audit: check allow: %w", err)
-	}
-	return count > 0, nil
-}
-
-func (s *Store) ListAllowed() ([]AllowEntry, error) {
-	rows, err := s.db.Query(
-		`SELECT id, target_type, target_name, reason, created_at
-		 FROM allow_list ORDER BY created_at DESC`,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("audit: list allowed: %w", err)
-	}
-	defer rows.Close()
-
-	var entries []AllowEntry
-	for rows.Next() {
-		var e AllowEntry
-		var reason sql.NullString
-		if err := rows.Scan(&e.ID, &e.TargetType, &e.TargetName, &reason, &e.CreatedAt); err != nil {
-			return nil, fmt.Errorf("audit: scan allow row: %w", err)
+func validateActionFieldAndValue(field, value string) error {
+	switch field {
+	case "install":
+		switch value {
+		case "", "block", "allow", "none":
+			return nil
+		default:
+			return fmt.Errorf("audit: invalid install action value %q", value)
 		}
-		e.Reason = reason.String
-		entries = append(entries, e)
+	case "file":
+		switch value {
+		case "", "quarantine", "none":
+			return nil
+		default:
+			return fmt.Errorf("audit: invalid file action value %q", value)
+		}
+	case "runtime":
+		switch value {
+		case "", "disable", "enable":
+			return nil
+		default:
+			return fmt.Errorf("audit: invalid runtime action value %q", value)
+		}
+	default:
+		return fmt.Errorf("audit: invalid action field %q", field)
 	}
-	return entries, rows.Err()
 }
 
 // --- TUI Queries ---
@@ -424,52 +601,6 @@ func (s *Store) ListFindingsByScan(scanID string) ([]FindingRow, error) {
 	return findings, rows.Err()
 }
 
-func (s *Store) ListBlockedByType(targetType string) ([]BlockEntry, error) {
-	rows, err := s.db.Query(
-		`SELECT id, target_type, target_name, reason, created_at
-		 FROM block_list WHERE target_type = ? ORDER BY created_at DESC`, targetType,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("audit: list blocked by type: %w", err)
-	}
-	defer rows.Close()
-
-	var entries []BlockEntry
-	for rows.Next() {
-		var e BlockEntry
-		var reason sql.NullString
-		if err := rows.Scan(&e.ID, &e.TargetType, &e.TargetName, &reason, &e.CreatedAt); err != nil {
-			return nil, fmt.Errorf("audit: scan block row: %w", err)
-		}
-		e.Reason = reason.String
-		entries = append(entries, e)
-	}
-	return entries, rows.Err()
-}
-
-func (s *Store) ListAllowedByType(targetType string) ([]AllowEntry, error) {
-	rows, err := s.db.Query(
-		`SELECT id, target_type, target_name, reason, created_at
-		 FROM allow_list WHERE target_type = ? ORDER BY created_at DESC`, targetType,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("audit: list allowed by type: %w", err)
-	}
-	defer rows.Close()
-
-	var entries []AllowEntry
-	for rows.Next() {
-		var e AllowEntry
-		var reason sql.NullString
-		if err := rows.Scan(&e.ID, &e.TargetType, &e.TargetName, &reason, &e.CreatedAt); err != nil {
-			return nil, fmt.Errorf("audit: scan allow row: %w", err)
-		}
-		e.Reason = reason.String
-		entries = append(entries, e)
-	}
-	return entries, rows.Err()
-}
-
 type Counts struct {
 	BlockedSkills int
 	AllowedSkills int
@@ -485,10 +616,10 @@ func (s *Store) GetCounts() (Counts, error) {
 		sql  string
 		dest *int
 	}{
-		{`SELECT COUNT(*) FROM block_list WHERE target_type = 'skill'`, &c.BlockedSkills},
-		{`SELECT COUNT(*) FROM allow_list WHERE target_type = 'skill'`, &c.AllowedSkills},
-		{`SELECT COUNT(*) FROM block_list WHERE target_type = 'mcp'`, &c.BlockedMCPs},
-		{`SELECT COUNT(*) FROM allow_list WHERE target_type = 'mcp'`, &c.AllowedMCPs},
+		{`SELECT COUNT(*) FROM actions WHERE target_type = 'skill' AND json_extract(actions_json, '$.install') = 'block'`, &c.BlockedSkills},
+		{`SELECT COUNT(*) FROM actions WHERE target_type = 'skill' AND json_extract(actions_json, '$.install') = 'allow'`, &c.AllowedSkills},
+		{`SELECT COUNT(*) FROM actions WHERE target_type = 'mcp' AND json_extract(actions_json, '$.install') = 'block'`, &c.BlockedMCPs},
+		{`SELECT COUNT(*) FROM actions WHERE target_type = 'mcp' AND json_extract(actions_json, '$.install') = 'allow'`, &c.AllowedMCPs},
 		{`SELECT COUNT(*) FROM audit_events WHERE severity IN ('CRITICAL','HIGH','MEDIUM','LOW')`, &c.Alerts},
 		{`SELECT COUNT(*) FROM scan_results`, &c.TotalScans},
 	}

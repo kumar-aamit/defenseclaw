@@ -13,6 +13,7 @@ import (
 	runewidth "github.com/mattn/go-runewidth"
 	"github.com/spf13/cobra"
 
+	"github.com/defenseclaw/defenseclaw/internal/audit"
 	"github.com/defenseclaw/defenseclaw/internal/config"
 	"github.com/defenseclaw/defenseclaw/internal/enforce"
 	"github.com/defenseclaw/defenseclaw/internal/gateway"
@@ -87,19 +88,31 @@ var skillRestoreCmd = &cobra.Command{
 	Long: `Move a previously quarantined skill back to its original location and
 re-allow it in the OpenShell sandbox policy.
 
-Requires --path to specify the original skill directory.`,
+By default, restores to the original path recorded during quarantine.
+Use --path to override the restore destination.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runSkillRestore,
 }
 
 var skillScanCmd = &cobra.Command{
-	Use:   "scan <path|all>",
-	Short: "Scan a skill directory or all configured skills",
-	Long: `Run skill-scanner against a skill directory and report a pass/fail verdict.
+	Use:   "scan <skill-name|all>",
+	Short: "Scan a skill by name or all configured skills",
+	Long: `Run skill-scanner against a skill and report a pass/fail verdict.
 
+The skill path is resolved automatically via 'openclaw skills info'.
+Use --path to override with an explicit directory.
 Use 'all' to scan all skills in the configured skill directories.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runSkillScan,
+}
+
+var skillInfoCmd = &cobra.Command{
+	Use:   "info <skill-name>",
+	Short: "Show detailed information about a skill",
+	Long: `Display merged skill metadata from OpenClaw, latest scan results from the
+DefenseClaw audit database, and enforcement actions (block/allow/quarantine/disable).`,
+	Args: cobra.ExactArgs(1),
+	RunE: runSkillInfo,
 }
 
 var skillListCmd = &cobra.Command{
@@ -130,6 +143,8 @@ Use --force to pass the --force flag to clawhub (overwrites existing).`,
 var (
 	skillActionReason   string
 	skillScanJSON       bool
+	skillScanPath       string
+	skillInfoJSON       bool
 	skillInstallForce   bool
 	skillInstallJSON    bool
 	skillInstallAction  bool
@@ -142,9 +157,10 @@ func init() {
 	skillBlockCmd.Flags().StringVar(&skillActionReason, "reason", "", "Reason for blocking")
 	skillAllowCmd.Flags().StringVar(&skillActionReason, "reason", "", "Reason for allowing")
 	skillQuarantineCmd.Flags().StringVar(&skillActionReason, "reason", "", "Reason for quarantine")
-	skillRestoreCmd.Flags().StringVar(&skillRestorePath, "path", "", "Original path to restore skill to (required)")
-	_ = skillRestoreCmd.MarkFlagRequired("path")
+	skillRestoreCmd.Flags().StringVar(&skillRestorePath, "path", "", "Override restore destination (defaults to original path)")
 	skillScanCmd.Flags().BoolVar(&skillScanJSON, "json", false, "Output scan results as JSON")
+	skillScanCmd.Flags().StringVar(&skillScanPath, "path", "", "Override skill directory path")
+	skillInfoCmd.Flags().BoolVar(&skillInfoJSON, "json", false, "Output skill info as JSON")
 	skillInstallCmd.Flags().BoolVar(&skillInstallForce, "force", false, "Force install (overwrites existing)")
 	skillInstallCmd.Flags().BoolVar(&skillInstallJSON, "json", false, "Output results as JSON")
 	skillInstallCmd.Flags().BoolVar(&skillInstallAction, "action", false, "Apply skill_actions policy based on scan severity")
@@ -157,6 +173,7 @@ func init() {
 	skillCmd.AddCommand(skillQuarantineCmd)
 	skillCmd.AddCommand(skillRestoreCmd)
 	skillCmd.AddCommand(skillScanCmd)
+	skillCmd.AddCommand(skillInfoCmd)
 	skillCmd.AddCommand(skillInstallCmd)
 	skillCmd.AddCommand(skillListCmd)
 	rootCmd.AddCommand(skillCmd)
@@ -176,6 +193,10 @@ func runSkillDisable(_ *cobra.Command, args []string) error {
 	if reason == "" {
 		reason = "manual disable via CLI"
 	}
+
+	pe := enforce.NewPolicyEngine(auditStore)
+	_ = pe.Disable("skill", skillName, reason)
+
 	_ = auditLog.LogAction("skill-disable", skillName, fmt.Sprintf("reason=%s", reason))
 	return nil
 }
@@ -187,6 +208,9 @@ func runSkillEnable(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("skill enable: %w", err)
 	}
 	fmt.Printf("[skill] %q enabled via gateway RPC\n", skillName)
+
+	pe := enforce.NewPolicyEngine(auditStore)
+	_ = pe.Enable("skill", skillName)
 
 	_ = auditLog.LogAction("skill-enable", skillName, "re-enabled via CLI")
 	return nil
@@ -206,6 +230,9 @@ func runSkillBlock(_ *cobra.Command, args []string) error {
 	if err := pe.Block("skill", skillName, reason); err != nil {
 		return fmt.Errorf("skill block: %w", err)
 	}
+	if skillPath := resolveInstalledSkillPath(skillName); skillPath != "" {
+		pe.SetSourcePath("skill", skillName, skillPath)
+	}
 	fmt.Printf("[skill] %q added to block list\n", skillName)
 
 	_ = auditLog.LogAction("skill-block", skillName, fmt.Sprintf("reason=%s", reason))
@@ -223,6 +250,9 @@ func runSkillAllow(_ *cobra.Command, args []string) error {
 
 	if err := pe.Allow("skill", skillName, reason); err != nil {
 		return fmt.Errorf("skill allow: %w", err)
+	}
+	if skillPath := resolveInstalledSkillPath(skillName); skillPath != "" {
+		pe.SetSourcePath("skill", skillName, skillPath)
 	}
 	fmt.Printf("[skill] %q added to allow list\n", skillName)
 
@@ -262,6 +292,11 @@ func runSkillQuarantine(_ *cobra.Command, args []string) error {
 	if reason == "" {
 		reason = "manual quarantine via CLI"
 	}
+
+	pe := enforce.NewPolicyEngine(auditStore)
+	_ = pe.Quarantine("skill", skillName, reason)
+	pe.SetSourcePath("skill", skillName, skillPath)
+
 	_ = auditLog.LogAction("skill-quarantine", skillName, fmt.Sprintf("reason=%s, dest=%s", reason, dest))
 	return nil
 }
@@ -276,16 +311,33 @@ func runSkillRestore(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("skill restore: %q is not quarantined", skillName)
 	}
 
-	if err := se.Restore(skillName, skillRestorePath); err != nil {
+	pe := enforce.NewPolicyEngine(auditStore)
+
+	restorePath := skillRestorePath
+	if restorePath == "" {
+		entry, err := pe.GetAction("skill", skillName)
+		if err != nil {
+			return fmt.Errorf("skill restore: failed to lookup original path: %w", err)
+		}
+		if entry == nil || entry.SourcePath == "" {
+			return fmt.Errorf("skill restore: no stored path for %q — use --path to specify restore destination", skillName)
+		}
+		restorePath = entry.SourcePath
+	}
+
+	if err := se.Restore(skillName, restorePath); err != nil {
 		return fmt.Errorf("skill restore: %w", err)
 	}
-	fmt.Printf("[skill] %q restored to %s\n", skillName, skillRestorePath)
+	fmt.Printf("[skill] %q restored to %s\n", skillName, restorePath)
 
 	if err := se.UpdateSandboxPolicy(skillName, false); err != nil {
 		fmt.Fprintf(os.Stderr, "[skill] sandbox policy update failed: %v\n", err)
 	}
 
-	_ = auditLog.LogAction("skill-restore", skillName, fmt.Sprintf("restored to %s", skillRestorePath))
+	_ = pe.ClearQuarantine("skill", skillName)
+	pe.SetSourcePath("skill", skillName, restorePath)
+
+	_ = auditLog.LogAction("skill-restore", skillName, fmt.Sprintf("restored to %s", restorePath))
 	return nil
 }
 
@@ -337,12 +389,129 @@ func runSkillScan(cmd *cobra.Command, args []string) error {
 		return runSkillScanAll(cmd)
 	}
 
-	verdict, err := scanSkillPath(cmd.Context(), target, !skillScanJSON)
+	scanDir := skillScanPath
+	if scanDir == "" {
+		info, err := getOpenclawSkillInfo(target)
+		if err != nil {
+			return fmt.Errorf("skill scan: could not resolve %q: %w", target, err)
+		}
+		if info.BaseDir == "" {
+			return fmt.Errorf("skill scan: no baseDir for %q — use --path to specify manually", target)
+		}
+		scanDir = info.BaseDir
+	}
+
+	verdict, err := scanSkillPath(cmd.Context(), scanDir, !skillScanJSON)
 	if err != nil {
 		return err
 	}
 
 	printSkillVerdict(verdict)
+	return nil
+}
+
+// getOpenclawSkillInfoRaw returns the raw JSON map from 'openclaw skills info <name> --json'.
+func getOpenclawSkillInfoRaw(name string) (map[string]interface{}, error) {
+	out, err := exec.Command("openclaw", "skills", "info", name, "--json").Output()
+	if err != nil {
+		return nil, fmt.Errorf("openclaw skills info %s: %w", name, err)
+	}
+
+	var m map[string]interface{}
+	if err := json.Unmarshal(out, &m); err != nil {
+		return nil, fmt.Errorf("parse skill info: %w", err)
+	}
+	return m, nil
+}
+
+func runSkillInfo(_ *cobra.Command, args []string) error {
+	skillName := args[0]
+
+	infoMap, err := getOpenclawSkillInfoRaw(skillName)
+	if err != nil {
+		return fmt.Errorf("skill info: %w", err)
+	}
+
+	scanMap := buildSkillScanMap()
+	if scan, ok := scanMap[skillName]; ok {
+		infoMap["scan"] = scan
+	}
+
+	actionsMap := buildSkillActionsMap()
+	if ae, ok := actionsMap[skillName]; ok {
+		if !ae.Actions.IsEmpty() {
+			infoMap["actions"] = &ae.Actions
+		}
+	}
+
+	if skillInfoJSON {
+		data, err := json.MarshalIndent(infoMap, "", "  ")
+		if err != nil {
+			return fmt.Errorf("skill info: json marshal: %w", err)
+		}
+		fmt.Println(string(data))
+		return nil
+	}
+
+	return printSkillInfoText(infoMap)
+}
+
+func skillInfoStr(m map[string]interface{}, key string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+func skillInfoBool(m map[string]interface{}, key string) bool {
+	if v, ok := m[key]; ok {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return false
+}
+
+func printSkillInfoText(m map[string]interface{}) error {
+	fmt.Printf("Skill:       %s\n", skillInfoStr(m, "name"))
+	if desc := skillInfoStr(m, "description"); desc != "" {
+		fmt.Printf("Description: %s\n", desc)
+	}
+	fmt.Printf("Source:      %s\n", skillInfoStr(m, "source"))
+	if baseDir := skillInfoStr(m, "baseDir"); baseDir != "" {
+		fmt.Printf("Path:        %s\n", baseDir)
+	}
+	if filePath := skillInfoStr(m, "filePath"); filePath != "" {
+		fmt.Printf("File:        %s\n", filePath)
+	}
+	fmt.Printf("Eligible:    %v\n", skillInfoBool(m, "eligible"))
+	fmt.Printf("Bundled:     %v\n", skillInfoBool(m, "bundled"))
+	if hp := skillInfoStr(m, "homepage"); hp != "" {
+		fmt.Printf("Homepage:    %s\n", hp)
+	}
+
+	if v, ok := m["scan"]; ok {
+		if scan, ok := v.(*skillScanEntry); ok {
+			fmt.Println()
+			fmt.Println("Last Scan:")
+			if scan.Clean {
+				fmt.Println("  Verdict:  CLEAN")
+			} else {
+				fmt.Printf("  Verdict:  %d %s findings\n", scan.TotalFindings, scan.MaxSeverity)
+			}
+			fmt.Printf("  Target:   %s\n", scan.Target)
+		}
+	}
+
+	if v, ok := m["actions"]; ok {
+		if actions, ok := v.(*audit.ActionState); ok && !actions.IsEmpty() {
+			fmt.Println()
+			fmt.Printf("Actions:     %s\n", actions.Summary())
+		}
+	}
+
 	return nil
 }
 
@@ -376,15 +545,16 @@ type openclawSkillsList struct {
 
 // skillListItem is the merged representation of an openclaw skill + latest scan data.
 type skillListItem struct {
-	Name        string           `json:"name"`
-	Description string           `json:"description"`
-	Source      string           `json:"source"`
-	Status      string           `json:"status"`
-	Eligible    bool             `json:"eligible"`
-	Disabled    bool             `json:"disabled"`
-	Bundled     bool             `json:"bundled"`
-	Homepage    string           `json:"homepage,omitempty"`
-	Scan        *skillScanEntry  `json:"scan,omitempty"`
+	Name        string            `json:"name"`
+	Description string            `json:"description"`
+	Source      string            `json:"source"`
+	Status      string            `json:"status"`
+	Eligible    bool              `json:"eligible"`
+	Disabled    bool              `json:"disabled"`
+	Bundled     bool              `json:"bundled"`
+	Homepage    string            `json:"homepage,omitempty"`
+	Scan        *skillScanEntry   `json:"scan,omitempty"`
+	Actions     *audit.ActionState `json:"actions,omitempty"`
 }
 
 // skillScanEntry holds the latest scan result for a skill, shaped like skill scan --json output.
@@ -558,11 +728,12 @@ func runSkillList(_ *cobra.Command, _ []string) error {
 	}
 
 	scanMap := buildSkillScanMap()
+	actionsMap := buildSkillActionsMap()
 
 	if skillListJSON {
-		return printSkillListJSON(list.Skills, scanMap)
+		return printSkillListJSON(list.Skills, scanMap, actionsMap)
 	}
-	return printSkillListTable(list.Skills, scanMap)
+	return printSkillListTable(list.Skills, scanMap, actionsMap)
 }
 
 func buildSkillScanMap() map[string]*skillScanEntry {
@@ -595,6 +766,21 @@ func buildSkillScanMap() map[string]*skillScanEntry {
 		scanMap[name] = entry
 	}
 	return scanMap
+}
+
+func buildSkillActionsMap() map[string]*audit.ActionEntry {
+	m := make(map[string]*audit.ActionEntry)
+	if auditStore == nil {
+		return m
+	}
+	entries, err := auditStore.ListActionsByType("skill")
+	if err != nil {
+		return m
+	}
+	for i, e := range entries {
+		m[e.TargetName] = &entries[i]
+	}
+	return m
 }
 
 // --- bordered table helpers ---
@@ -644,7 +830,7 @@ func tableCell(s string, width int) string {
 	return " " + strPadRight(s, width) + " "
 }
 
-func printSkillListTable(skills []openclawSkill, scanMap map[string]*skillScanEntry) error {
+func printSkillListTable(skills []openclawSkill, scanMap map[string]*skillScanEntry, actionsMap map[string]*audit.ActionEntry) error {
 	readyCount := 0
 	for _, s := range skills {
 		if s.Eligible && !s.Disabled {
@@ -653,17 +839,18 @@ func printSkillListTable(skills []openclawSkill, scanMap map[string]*skillScanEn
 	}
 
 	type rowData struct {
-		status, skill, desc, source, severity string
+		status, skill, desc, source, severity, actions string
 	}
 
 	rows := make([]rowData, len(skills))
-	headers := [5]string{"Status", "Skill", "Description", "Source", "Severity"}
-	colW := [5]int{
+	headers := [6]string{"Status", "Skill", "Description", "Source", "Severity", "Actions"}
+	colW := [6]int{
 		strDisplayWidth(headers[0]),
 		strDisplayWidth(headers[1]),
 		0,
 		strDisplayWidth(headers[3]),
 		strDisplayWidth(headers[4]),
+		strDisplayWidth(headers[5]),
 	}
 
 	for i, s := range skills {
@@ -673,9 +860,13 @@ func printSkillListTable(skills []openclawSkill, scanMap map[string]*skillScanEn
 			desc:     s.Description,
 			source:   s.Source,
 			severity: "-",
+			actions:  "-",
 		}
 		if scan, ok := scanMap[s.Name]; ok {
 			rows[i].severity = string(scan.MaxSeverity)
+		}
+		if ae, ok := actionsMap[s.Name]; ok {
+			rows[i].actions = ae.Actions.Summary()
 		}
 		if w := strDisplayWidth(rows[i].status); w > colW[0] {
 			colW[0] = w
@@ -689,14 +880,16 @@ func printSkillListTable(skills []openclawSkill, scanMap map[string]*skillScanEn
 		if w := strDisplayWidth(rows[i].severity); w > colW[4] {
 			colW[4] = w
 		}
+		if w := strDisplayWidth(rows[i].actions); w > colW[5] {
+			colW[5] = w
+		}
 	}
 
-	fixedUsed := colW[0] + colW[1] + colW[3] + colW[4]
-	// 5 columns → 6 borders, each cell has 2-char padding (space on each side)
-	chrome := 6 + 5*2
-	descW := 120 - fixedUsed - chrome
-	if descW < 40 {
-		descW = 40
+	fixedUsed := colW[0] + colW[1] + colW[3] + colW[4] + colW[5]
+	chrome := 7 + 6*2 // 6 columns → 7 borders, each cell has 2-char padding
+	descW := 130 - fixedUsed - chrome
+	if descW < 30 {
+		descW = 30
 	}
 	colW[2] = descW
 
@@ -704,12 +897,13 @@ func printSkillListTable(skills []openclawSkill, scanMap map[string]*skillScanEn
 
 	fmt.Printf("\nSkills (%d/%d ready)\n", readyCount, len(skills))
 	fmt.Println(tableHLine(widths, "┌", "┬", "┐", "─"))
-	fmt.Printf("│%s│%s│%s│%s│%s│\n",
+	fmt.Printf("│%s│%s│%s│%s│%s│%s│\n",
 		tableCell(headers[0], colW[0]),
 		tableCell(headers[1], colW[1]),
 		tableCell(headers[2], colW[2]),
 		tableCell(headers[3], colW[3]),
 		tableCell(headers[4], colW[4]),
+		tableCell(headers[5], colW[5]),
 	)
 	fmt.Println(tableHLine(widths, "├", "┼", "┤", "─"))
 
@@ -718,20 +912,22 @@ func printSkillListTable(skills []openclawSkill, scanMap map[string]*skillScanEn
 		if len(descLines) == 0 {
 			descLines = []string{""}
 		}
-		fmt.Printf("│%s│%s│%s│%s│%s│\n",
+		fmt.Printf("│%s│%s│%s│%s│%s│%s│\n",
 			tableCell(r.status, colW[0]),
 			tableCell(r.skill, colW[1]),
 			tableCell(descLines[0], colW[2]),
 			tableCell(r.source, colW[3]),
 			tableCell(r.severity, colW[4]),
+			tableCell(r.actions, colW[5]),
 		)
 		for _, line := range descLines[1:] {
-			fmt.Printf("│%s│%s│%s│%s│%s│\n",
+			fmt.Printf("│%s│%s│%s│%s│%s│%s│\n",
 				tableCell("", colW[0]),
 				tableCell("", colW[1]),
 				tableCell(line, colW[2]),
 				tableCell("", colW[3]),
 				tableCell("", colW[4]),
+				tableCell("", colW[5]),
 			)
 		}
 	}
@@ -740,7 +936,7 @@ func printSkillListTable(skills []openclawSkill, scanMap map[string]*skillScanEn
 	return nil
 }
 
-func printSkillListJSON(skills []openclawSkill, scanMap map[string]*skillScanEntry) error {
+func printSkillListJSON(skills []openclawSkill, scanMap map[string]*skillScanEntry, actionsMap map[string]*audit.ActionEntry) error {
 	items := make([]skillListItem, 0, len(skills))
 	for _, s := range skills {
 		item := skillListItem{
@@ -755,6 +951,9 @@ func printSkillListJSON(skills []openclawSkill, scanMap map[string]*skillScanEnt
 		}
 		if scan, ok := scanMap[s.Name]; ok {
 			item.Scan = scan
+		}
+		if ae, ok := actionsMap[s.Name]; ok {
+			item.Actions = &ae.Actions
 		}
 		items = append(items, item)
 	}
@@ -831,10 +1030,12 @@ func runSkillInstall(cmd *cobra.Command, args []string) error {
 	shouldQuarantine := action.File == config.FileActionQuarantine
 	shouldDisable := action.Runtime == config.RuntimeDisable
 	shouldBlock := action.Install == config.InstallBlock
+	shouldAllow := action.Install == config.InstallAllow
 
 	shell := sandbox.NewWithFallback(cfg.OpenShell.Binary, cfg.OpenShell.PolicyDir, cfg.PolicyDir)
 	se := enforce.NewSkillEnforcer(cfg.QuarantineDir, shell)
 
+	enforcementReason := fmt.Sprintf("post-install scan: %d findings, max=%s", verdict.TotalFindings, verdict.MaxSeverity)
 	var actions []string
 
 	if shouldQuarantine {
@@ -842,6 +1043,7 @@ func runSkillInstall(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "[install] quarantine failed: %v\n", qErr)
 		} else {
 			actions = append(actions, fmt.Sprintf("quarantined to %s", dest))
+			_ = pe.Quarantine("skill", skillName, enforcementReason)
 		}
 	}
 	if shouldDisable {
@@ -849,13 +1051,19 @@ func runSkillInstall(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(os.Stderr, "[install] gateway disable failed: %v\n", dErr)
 		} else {
 			actions = append(actions, "disabled via gateway")
+			_ = pe.Disable("skill", skillName, enforcementReason)
 		}
 	}
 	if shouldBlock {
-		blockReason := fmt.Sprintf("post-install scan: %d findings, max=%s", verdict.TotalFindings, verdict.MaxSeverity)
-		_ = pe.Block("skill", skillName, blockReason)
+		_ = pe.Block("skill", skillName, enforcementReason)
 		actions = append(actions, "added to block list")
 	}
+	if shouldAllow {
+		_ = pe.Allow("skill", skillName, enforcementReason)
+		actions = append(actions, "added to allow list")
+	}
+
+	pe.SetSourcePath("skill", skillName, skillPath)
 
 	if len(actions) > 0 {
 		fmt.Printf("[install] %q: %s (%s)\n", skillName, strings.Join(actions, ", "), detail)
