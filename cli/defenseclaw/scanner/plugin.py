@@ -48,8 +48,13 @@ class PluginScannerWrapper:
 
         if proc.stdout.strip():
             try:
+                # The TS plugin scanner outputs a full ScanResult object with
+                # scanner, target, timestamp, findings[], duration_ns, metadata,
+                # and assessment fields (see extensions/defenseclaw/src/types.ts).
                 data = json.loads(proc.stdout)
                 for f in data.get("findings", []):
+                    if f.get("suppressed", False):
+                        continue
                     findings.append(Finding(
                         id=f.get("id", ""),
                         severity=f.get("severity", "INFO"),
