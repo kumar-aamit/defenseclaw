@@ -14,8 +14,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple
 
-from defenseclaw.config import Config, _expand
-from defenseclaw.models import Finding, ScanResult
+from defenseclaw.config import Config, SkillActionsConfig, _expand
+from defenseclaw.models import ActionEntry, Finding, ScanResult
 
 INVENTORY_VERSION = 3
 
@@ -147,6 +147,136 @@ def claw_aibom_to_scan_result(inv: dict[str, Any], cfg: Config) -> ScanResult:
     )
 
 
+_POLICY_CATEGORIES: list[tuple[str, str, str]] = [
+    ("skills", "skill", "skill-scanner"),
+    ("plugins", "plugin", "plugin-scanner"),
+    ("mcp", "mcp", "mcp-scanner"),
+]
+
+
+def enrich_with_policy(
+    inv: dict[str, Any],
+    store: Any,
+    skill_actions: SkillActionsConfig | None = None,
+) -> None:
+    """Evaluate OPA-style admission gate per item and annotate the inventory.
+
+    Adds ``policy_verdict`` and ``policy_detail`` to each skill, plugin, and
+    MCP server dict. Adds per-category ``policy_<category>`` counts to the
+    summary. Mirrors the Rego ``admission.rego`` logic:
+    block list -> allow list -> scan -> severity-based verdict.
+    """
+    if not store:
+        return
+
+    from defenseclaw.enforce import PolicyEngine
+
+    pe = PolicyEngine(store)
+    if skill_actions is None:
+        skill_actions = SkillActionsConfig()
+
+    for inv_key, target_type, scanner_name in _POLICY_CATEGORIES:
+        items = inv.get(inv_key, [])
+        if not items:
+            continue
+
+        actions_map = _build_actions_map_for_type(store, target_type)
+        scan_map = _build_scan_map_for_type(store, scanner_name)
+
+        counts: dict[str, int] = {
+            "blocked": 0, "allowed": 0, "rejected": 0,
+            "warning": 0, "clean": 0, "unscanned": 0,
+        }
+
+        for item in items:
+            name = item.get("id", "")
+            if not name:
+                continue
+
+            verdict, detail = _admission_verdict(
+                pe, target_type, name,
+                scan_map.get(name), actions_map.get(name),
+                skill_actions,
+            )
+            item["policy_verdict"] = verdict
+            item["policy_detail"] = detail
+            counts[verdict] = counts.get(verdict, 0) + 1
+
+        summary = inv.get("summary")
+        if summary:
+            summary[f"policy_{inv_key}"] = counts
+
+
+# keep the old name as an alias for backward compatibility
+enrich_skills_with_policy = enrich_with_policy
+
+
+def _admission_verdict(
+    pe: Any,
+    target_type: str,
+    name: str,
+    scan_entry: dict[str, Any] | None,
+    action_entry: ActionEntry | None,
+    skill_actions: SkillActionsConfig,
+) -> tuple[str, str]:
+    """Replicate OPA admission.rego logic in Python for offline evaluation."""
+    if pe.is_blocked(target_type, name):
+        reason = action_entry.reason if action_entry else "block list"
+        return "blocked", reason
+
+    if pe.is_allowed(target_type, name):
+        reason = action_entry.reason if action_entry else "allow list"
+        return "allowed", reason
+
+    if pe.is_quarantined(target_type, name):
+        reason = action_entry.reason if action_entry else "quarantined"
+        return "rejected", f"quarantined: {reason}"
+
+    if scan_entry is None:
+        return "unscanned", "no scan result"
+
+    if scan_entry["finding_count"] == 0:
+        return "clean", "scan clean"
+
+    sev = scan_entry["max_severity"]
+    n = scan_entry["finding_count"]
+    action = skill_actions.for_severity(sev)
+
+    if action.install == "block" or action.runtime == "disable":
+        return "rejected", f"{n} findings, max {sev}"
+
+    return "warning", f"{n} findings, max {sev}"
+
+
+def _build_actions_map_for_type(store: Any, target_type: str) -> dict[str, ActionEntry]:
+    actions_map: dict[str, ActionEntry] = {}
+    try:
+        entries = store.list_actions_by_type(target_type)
+    except Exception:
+        return actions_map
+    for e in entries:
+        actions_map[e.target_name] = e
+    return actions_map
+
+
+def _build_scan_map_for_type(store: Any, scanner_name: str) -> dict[str, dict[str, Any]]:
+    import os
+
+    scan_map: dict[str, dict[str, Any]] = {}
+    try:
+        latest = store.latest_scans_by_scanner(scanner_name)
+    except Exception:
+        return scan_map
+    for ls in latest:
+        name = os.path.basename(ls["target"])
+        scan_map[name] = {
+            "target": ls["target"],
+            "finding_count": ls["finding_count"],
+            "max_severity": ls["max_severity"] or "INFO",
+        }
+    return scan_map
+
+
 def format_claw_aibom_human(
     inv: dict[str, Any],
     *,
@@ -251,19 +381,49 @@ def _render_summary(console: Any, inv: dict[str, Any]) -> None:
     table.add_column("Detail")
 
     sk = data.get("skills", {})
-    table.add_row("Skills", str(sk.get("count", 0)), f"{sk.get('eligible', 0)} eligible")
+    sk_detail = f"{sk.get('eligible', 0)} eligible"
+    sk_detail += _policy_detail_suffix(data.get("policy_skills"))
+    table.add_row("Skills", str(sk.get("count", 0)), sk_detail)
+
     pl = data.get("plugins", {})
-    table.add_row(
-        "Plugins",
-        str(pl.get("count", 0)),
-        f"{pl.get('loaded', 0)} loaded, {pl.get('disabled', 0)} disabled",
-    )
-    table.add_row("MCP servers", str(data.get("mcp", {}).get("count", 0)))
+    pl_detail = f"{pl.get('loaded', 0)} loaded, {pl.get('disabled', 0)} disabled"
+    pl_detail += _policy_detail_suffix(data.get("policy_plugins"))
+    table.add_row("Plugins", str(pl.get("count", 0)), pl_detail)
+
+    mcp_detail = _policy_detail_suffix(data.get("policy_mcp")).lstrip(" · ") or ""
+    table.add_row("MCP servers", str(data.get("mcp", {}).get("count", 0)), mcp_detail)
     table.add_row("Agents", str(data.get("agents", {}).get("count", 0)))
     table.add_row("Tools", str(data.get("tools", {}).get("count", 0)))
     table.add_row("Model providers", str(data.get("model_providers", {}).get("count", 0)))
     table.add_row("Memory stores", str(data.get("memory", {}).get("count", 0)))
     console.print(table)
+
+
+def _policy_detail_suffix(policy: dict[str, int] | None) -> str:
+    if not policy:
+        return ""
+    parts: list[str] = []
+    if policy.get("blocked"):
+        parts.append(f"[red]{policy['blocked']} blocked[/red]")
+    if policy.get("rejected"):
+        parts.append(f"[red]{policy['rejected']} rejected[/red]")
+    if policy.get("warning"):
+        parts.append(f"[yellow]{policy['warning']} warning[/yellow]")
+    if policy.get("clean"):
+        parts.append(f"[green]{policy['clean']} clean[/green]")
+    if policy.get("unscanned"):
+        parts.append(f"[dim]{policy['unscanned']} unscanned[/dim]")
+    return " · " + ", ".join(parts) if parts else ""
+
+
+_VERDICT_STYLES: dict[str, tuple[str, str]] = {
+    "blocked": ("bold red", "⛔ blocked"),
+    "rejected": ("red", "✗ rejected"),
+    "warning": ("yellow", "⚠ warning"),
+    "clean": ("green", "✓ clean"),
+    "allowed": ("cyan", "↪ allowed"),
+    "unscanned": ("dim", "… unscanned"),
+}
 
 
 def _render_skills(console: Any, skills: list[dict[str, Any]]) -> None:
@@ -275,26 +435,50 @@ def _render_skills(console: Any, skills: list[dict[str, Any]]) -> None:
 
     eligible = [s for s in skills if s.get("eligible")]
     ineligible = [s for s in skills if not s.get("eligible")]
+    has_policy = any(s.get("policy_verdict") for s in skills)
 
     if eligible:
         table = Table(title=f"Skills — eligible ({len(eligible)})")
         table.add_column("Name", style="green bold")
         table.add_column("Source")
-        table.add_column("Description", max_width=60)
+        table.add_column("Description", max_width=50)
+        if has_policy:
+            table.add_column("Policy", min_width=14)
         for s in eligible:
-            table.add_row(
+            row = [
                 s.get("id", ""),
                 s.get("source", ""),
-                _trunc(s.get("description", ""), 60),
-            )
+                _trunc(s.get("description", ""), 50),
+            ]
+            if has_policy:
+                row.append(_format_verdict(s))
+            table.add_row(*row)
         console.print(table)
 
     if ineligible:
+        blocked_count = sum(
+            1 for s in ineligible if s.get("policy_verdict") == "blocked"
+        )
+        parts = ["missing deps"]
+        if blocked_count:
+            parts.append(f"{blocked_count} blocked by policy")
         console.print(
             f"  [dim]+ {len(ineligible)} ineligible skills "
-            f"(missing deps)[/dim]"
+            f"({', '.join(parts)})[/dim]"
         )
     console.print()
+
+
+def _format_verdict(skill: dict[str, Any]) -> str:
+    verdict = skill.get("policy_verdict", "")
+    if not verdict:
+        return "[dim]-[/dim]"
+    style, label = _VERDICT_STYLES.get(verdict, ("dim", verdict))
+    detail = skill.get("policy_detail", "")
+    cell = f"[{style}]{label}[/{style}]"
+    if detail and verdict in ("rejected", "warning"):
+        cell += f"\n[dim]{_trunc(detail, 30)}[/dim]"
+    return cell
 
 
 def _render_plugins(console: Any, plugins: list[dict[str, Any]]) -> None:
@@ -306,22 +490,32 @@ def _render_plugins(console: Any, plugins: list[dict[str, Any]]) -> None:
 
     loaded = [p for p in plugins if p.get("enabled")]
     disabled = [p for p in plugins if not p.get("enabled")]
+    has_policy = any(p.get("policy_verdict") for p in plugins)
 
     table = Table(title=f"Plugins — loaded ({len(loaded)})")
     table.add_column("ID", style="bold")
     table.add_column("Origin")
     table.add_column("Providers")
     table.add_column("Tools")
+    if has_policy:
+        table.add_column("Policy", min_width=14)
     for p in loaded:
         provs = ", ".join(p.get("providerIds", []))
         tools = ", ".join(p.get("toolNames", []))
-        table.add_row(p.get("id", ""), p.get("origin", ""), provs or "-", tools or "-")
+        row = [p.get("id", ""), p.get("origin", ""), provs or "-", tools or "-"]
+        if has_policy:
+            row.append(_format_verdict(p))
+        table.add_row(*row)
     console.print(table)
 
     if disabled:
-        names = ", ".join(p.get("id", "") for p in disabled[:10])
-        suffix = f" … +{len(disabled) - 10} more" if len(disabled) > 10 else ""
-        console.print(f"  [dim]+ {len(disabled)} disabled: {names}{suffix}[/dim]")
+        blocked_count = sum(
+            1 for p in disabled if p.get("policy_verdict") == "blocked"
+        )
+        parts = [f"{len(disabled)} disabled"]
+        if blocked_count:
+            parts.append(f"{blocked_count} blocked by policy")
+        console.print(f"  [dim]+ {', '.join(parts)}[/dim]")
     console.print()
 
 
@@ -332,21 +526,28 @@ def _render_mcp(console: Any, mcps: list[dict[str, Any]]) -> None:
 
     from rich.table import Table
 
+    has_policy = any(m.get("policy_verdict") for m in mcps)
+
     table = Table(title=f"MCP Servers ({len(mcps)})")
     table.add_column("Name", style="bold")
     table.add_column("Transport")
     table.add_column("Command / URL")
     table.add_column("Env keys")
+    if has_policy:
+        table.add_column("Policy", min_width=14)
     for m in mcps:
         cmd_or_url = m.get("command") or m.get("url", "")
         if m.get("args"):
             cmd_or_url += " " + " ".join(str(a) for a in m["args"][:3])
-        table.add_row(
+        row = [
             m.get("id", ""),
             m.get("transport", "stdio"),
             _trunc(cmd_or_url, 50),
             ", ".join(m.get("env_keys", [])) or "-",
-        )
+        ]
+        if has_policy:
+            row.append(_format_verdict(m))
+        table.add_row(*row)
     console.print(table)
     console.print()
 

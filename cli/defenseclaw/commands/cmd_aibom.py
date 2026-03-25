@@ -43,6 +43,7 @@ def scan(app: AppContext, as_json: bool, summary_only: bool, categories: str | N
     from defenseclaw.inventory.claw_inventory import (
         build_claw_aibom,
         claw_aibom_to_scan_result,
+        enrich_with_policy,
         format_claw_aibom_human,
     )
 
@@ -53,6 +54,8 @@ def scan(app: AppContext, as_json: bool, summary_only: bool, categories: str | N
     click.echo("Scanning live OpenClaw environment …", err=True)
     inv = build_claw_aibom(app.cfg, live=True, categories=cats)
     result = claw_aibom_to_scan_result(inv, app.cfg)
+
+    enrich_with_policy(inv, app.store, app.cfg.skill_actions)
 
     if app.logger:
         app.logger.log_scan(result)
