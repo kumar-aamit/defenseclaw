@@ -44,9 +44,9 @@ func (p *Provider) EmitStartupSpan(ctx context.Context) {
 }
 
 // EmitInspectSpan creates a span for a tool/message inspection evaluation.
-func (p *Provider) EmitInspectSpan(ctx context.Context, tool, action, severity string, durationMs float64) {
+func (p *Provider) EmitInspectSpan(ctx context.Context, tool, action, severity string, durationMs float64) string {
 	if !p.TracesEnabled() {
-		return
+		return ""
 	}
 	_, span := p.tracer.Start(ctx, fmt.Sprintf("inspect/%s", tool),
 		trace.WithSpanKind(trace.SpanKindInternal),
@@ -63,7 +63,9 @@ func (p *Provider) EmitInspectSpan(ctx context.Context, tool, action, severity s
 	} else {
 		span.SetStatus(codes.Ok, "")
 	}
+	traceID := span.SpanContext().TraceID().String()
 	span.End()
+	return traceID
 }
 
 // StartToolSpan starts a new OTel span for a tool_call event.

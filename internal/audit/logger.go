@@ -114,7 +114,37 @@ func (l *Logger) LogScanWithVerdict(result *scanner.ScanResult, verdict string) 
 
 // LogAction persists an action event and emits OTel lifecycle signals.
 func (l *Logger) LogAction(action, target, details string) error {
-	return l.LogActionWithEnforcement(action, target, details, nil)
+	return l.LogActionWithTrace(action, target, details, "")
+}
+
+// LogActionWithTrace persists an action event with an OTel trace ID for
+// cross-system correlation between Splunk O11y and Splunk local.
+func (l *Logger) LogActionWithTrace(action, target, details, traceID string) error {
+	event := Event{
+		Timestamp: time.Now().UTC(),
+		Action:    action,
+		Target:    target,
+		Details:   details,
+		Severity:  "INFO",
+		TraceID:   traceID,
+	}
+	if err := l.store.LogEvent(event); err != nil {
+		if l.otel != nil {
+			l.otel.RecordAuditDBError(context.Background(), "insert_event")
+		}
+		return err
+	}
+	if l.otel != nil {
+		l.otel.RecordAuditEvent(context.Background(), event.Action, event.Severity)
+	}
+	l.forwardToSplunk(event)
+
+	if l.otel != nil {
+		assetType := inferAssetTypeFromAction(action, details)
+		l.otel.EmitLifecycleEvent(action, target, assetType, details, event.Severity, nil)
+	}
+
+	return nil
 }
 
 // LogActionWithEnforcement persists an action event with enforcement metadata

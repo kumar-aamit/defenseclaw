@@ -35,6 +35,7 @@ type Event struct {
 	Actor     string    `json:"actor"`
 	Details   string    `json:"details"`
 	Severity  string    `json:"severity"`
+	TraceID   string    `json:"trace_id,omitempty"`
 }
 
 // ActionState tracks enforcement state across three independent dimensions.

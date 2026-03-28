@@ -80,6 +80,7 @@ type splunkAuditEvent struct {
 	Details   string `json:"details"`
 	Severity  string `json:"severity"`
 	Source    string `json:"source"`
+	TraceID   string `json:"trace_id,omitempty"`
 }
 
 func NewSplunkForwarder(cfg SplunkConfig) (*SplunkForwarder, error) {
@@ -139,6 +140,7 @@ func (f *SplunkForwarder) ForwardEvent(e Event) error {
 			Details:   e.Details,
 			Severity:  e.Severity,
 			Source:    "defenseclaw",
+			TraceID:   e.TraceID,
 		},
 	}
 
