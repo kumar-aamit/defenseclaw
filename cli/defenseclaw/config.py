@@ -407,6 +407,7 @@ class GatewayWatcherConfig:
 class GatewayConfig:
     host: str = "127.0.0.1"
     port: int = 18789
+    api_bind: str = ""
     token: str = ""
     token_env: str = ""
     device_key_file: str = ""
@@ -543,6 +544,7 @@ class WebhookConfig:
     min_severity: str = "HIGH"
     events: list[str] = field(default_factory=list)
     timeout_seconds: int = 10
+    cooldown_seconds: int = 300
     enabled: bool = False
 
     def resolved_secret(self) -> str:
@@ -949,6 +951,7 @@ def _merge_webhooks(raw: list[dict[str, Any]] | None) -> list[WebhookConfig]:
             min_severity=entry.get("min_severity", "HIGH"),
             events=entry.get("events", []),
             timeout_seconds=entry.get("timeout_seconds", 10),
+            cooldown_seconds=entry.get("cooldown_seconds", 300),
             enabled=entry.get("enabled", False),
         ))
     return webhooks
@@ -1119,6 +1122,7 @@ def load() -> Config:
         gateway=GatewayConfig(
             host=gw_raw.get("host", "127.0.0.1"),
             port=gw_raw.get("port", 18789),
+            api_bind=gw_raw.get("api_bind", ""),
             token=gw_raw.get("token", ""),
             token_env=gw_raw.get("token_env", ""),
             device_key_file=gw_raw.get("device_key_file", os.path.join(data_dir, "device.key")),

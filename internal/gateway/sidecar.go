@@ -132,6 +132,11 @@ func (s *Sidecar) Run(ctx context.Context) error {
 		fmt.Fprintf(os.Stderr, "[sidecar]          Set guardrail.model in ~/.defenseclaw/config.yaml only if you need a fixed advertised model name.\n")
 	}
 
+	if strings.EqualFold(s.cfg.Guardrail.Host, "localhost") {
+		fmt.Fprintf(os.Stderr, "[sidecar] WARNING: guardrail.host is set to \"localhost\" which may resolve to IPv6 (::1) on macOS.\n")
+		fmt.Fprintf(os.Stderr, "[sidecar]          The proxy binds 127.0.0.1 only. Set guardrail.host to \"127.0.0.1\" to avoid silent connection failures.\n")
+	}
+
 	// Initialize OPA engine before goroutines so both the watcher and the
 	// API reload handler share the same instance.
 	if s.cfg.PolicyDir != "" {
@@ -319,6 +324,7 @@ func (s *Sidecar) runWatcher(ctx context.Context) error {
 		"plugin_dirs":        len(pluginDirs),
 		"skill_take_action":  wcfg.Skill.TakeAction,
 		"plugin_take_action": wcfg.Plugin.TakeAction,
+		"mcp_take_action":    wcfg.MCP.TakeAction,
 	})
 
 	w := watcher.New(s.cfg, skillDirs, pluginDirs, s.store, s.logger, s.shell, s.opa, s.otel, func(r watcher.AdmissionResult) {
@@ -339,6 +345,7 @@ func (s *Sidecar) runWatcher(ctx context.Context) error {
 		"plugin_dirs":        len(pluginDirs),
 		"skill_take_action":  wcfg.Skill.TakeAction,
 		"plugin_take_action": wcfg.Plugin.TakeAction,
+		"mcp_take_action":    wcfg.MCP.TakeAction,
 	})
 
 	err := w.Run(ctx)
@@ -361,6 +368,8 @@ func (s *Sidecar) handleAdmissionResult(r watcher.AdmissionResult) {
 		s.handleSkillAdmission(r)
 	case watcher.InstallPlugin:
 		s.handlePluginAdmission(r)
+	case watcher.InstallMCP:
+		s.handleMCPAdmission(r)
 	default:
 		if s.logger != nil {
 			_ = s.logger.LogAction("sidecar-watcher-verdict", r.Event.Name,
@@ -387,7 +396,7 @@ func (s *Sidecar) handleSkillAdmission(r watcher.AdmissionResult) {
 		actions = append(actions, "blocked")
 	}
 
-	if shouldDisableAtGateway(r) {
+	if shouldDisableAtGateway(r) && s.client != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
@@ -513,7 +522,7 @@ func (s *Sidecar) handlePluginAdmission(r watcher.AdmissionResult) {
 		actions = append(actions, "blocked")
 	}
 
-	if shouldDisableAtGateway(r) {
+	if shouldDisableAtGateway(r) && s.client != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
@@ -532,6 +541,46 @@ func (s *Sidecar) handlePluginAdmission(r watcher.AdmissionResult) {
 	go func() {
 		defer s.alertWg.Done()
 		s.sendEnforcementAlert("plugin", r.Event.Name, r.MaxSeverity, r.FindingCount, actions, r.Reason)
+	}()
+}
+
+func (s *Sidecar) handleMCPAdmission(r watcher.AdmissionResult) {
+	if !s.cfg.Gateway.Watcher.MCP.TakeAction {
+		fmt.Fprintf(os.Stderr, "[sidecar] watcher: mcp %s verdict=%s (take_action=false, logging only)\n",
+			r.Event.Name, r.Verdict)
+		_ = s.logger.LogAction("sidecar-watcher-verdict", r.Event.Name,
+			fmt.Sprintf("verdict=%s (mcp take_action disabled, no gateway action)", r.Verdict))
+		return
+	}
+
+	var actions []string
+
+	if r.FileAction == "quarantine" {
+		actions = append(actions, "quarantined")
+	}
+	if r.Verdict == watcher.VerdictBlocked || r.InstallAction == "block" {
+		actions = append(actions, "blocked")
+	}
+
+	if shouldDisableAtGateway(r) && s.client != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := s.client.BlockMCPServer(ctx, r.Event.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "[sidecar] watcher→gateway block MCP %s failed: %v\n",
+				r.Event.Name, err)
+		} else {
+			actions = append(actions, "disabled")
+			fmt.Fprintf(os.Stderr, "[sidecar] watcher→gateway blocked MCP %s\n", r.Event.Name)
+			_ = s.logger.LogAction("sidecar-watcher-block-mcp", r.Event.Name,
+				fmt.Sprintf("auto-blocked MCP server via gateway after verdict=%s", r.Verdict))
+		}
+	}
+
+	s.alertWg.Add(1)
+	go func() {
+		defer s.alertWg.Done()
+		s.sendEnforcementAlert("mcp", r.Event.Name, r.MaxSeverity, r.FindingCount, actions, r.Reason)
 	}()
 }
 
