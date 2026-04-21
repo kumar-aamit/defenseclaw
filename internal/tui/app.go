@@ -18,6 +18,7 @@ package tui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -40,13 +41,20 @@ const (
 	PanelLogs
 	PanelAudit
 	PanelActivity
+	// PanelTools is inserted immediately before PanelSetup so the
+	// existing numeric key bindings (1–9 for the first nine
+	// panels, 0 for Setup) all remain stable. Tools is reached
+	// via the dedicated 'T' keybinding, the command palette, or
+	// tab navigation. Re-ordering would silently change muscle
+	// memory for every operator — don't do it without a migration.
+	PanelTools
 	PanelSetup
 	panelCount
 )
 
 var panelNames = [panelCount]string{
 	"Overview", "Alerts", "Skills", "MCPs", "Plugins",
-	"Inventory", "Policy", "Logs", "Audit", "Activity", "Setup",
+	"Inventory", "Policy", "Logs", "Audit", "Activity", "Tools", "Setup",
 }
 
 const refreshInterval = 5 * time.Second
@@ -101,12 +109,14 @@ type Model struct {
 	logs      LogsPanel
 	auditHist AuditPanel
 	activity  ActivityPanel
+	tools     ToolsPanel
 	setup     SetupPanel
 
 	// Overlays
 	detail     DetailModal
 	palette    PaletteModel
 	actionMenu ActionMenu
+	mcpSetForm MCPSetForm
 	helpOpen   bool
 
 	// Persistent command input
@@ -179,10 +189,12 @@ func New(deps Deps) Model {
 		logs:       NewLogsPanel(theme, deps.Config),
 		auditHist:  NewAuditPanel(theme, deps.Store),
 		activity:   NewActivityPanel(theme),
+		tools:      NewToolsPanel(deps.Store),
 		setup:      NewSetupPanel(theme, deps.Config, executor),
 		detail:     NewDetailModal(),
 		palette:    NewPaletteModel(theme, registry, executor),
 		actionMenu: NewActionMenu(theme),
+		mcpSetForm: NewMCPSetForm(),
 
 		cmdInput: ti,
 
@@ -208,7 +220,46 @@ func (m Model) Init() tea.Cmd {
 		m.logs.Init(),
 		tickSpin(),
 		func() tea.Msg { return tea.RequestBackgroundColor() },
+		// P3-#21: load the cached doctor snapshot from disk so
+		// the Overview panel can render status immediately
+		// without waiting for the user to manually re-run doctor.
+		m.loadDoctorCacheCmd(),
 	)
+}
+
+// isDoctorCommand reports whether the display-name passed to
+// CommandExecutor.Execute corresponds to a `defenseclaw doctor`
+// invocation. We match on the prefix rather than exact string so
+// future variants ("doctor --json-output", "doctor --verbose")
+// keep triggering a cache reload without a code change here.
+func isDoctorCommand(cmd string) bool {
+	cmd = strings.TrimSpace(cmd)
+	return cmd == "doctor" || strings.HasPrefix(cmd, "doctor ")
+}
+
+// doctorCacheLoadedMsg carries either a successfully-loaded
+// DoctorCache or a soft load error. We always include both so the
+// Update handler can decide whether to toast the error — a
+// NotExist error on first launch is perfectly normal and should
+// stay quiet.
+type doctorCacheLoadedMsg struct {
+	Cache *DoctorCache
+	Err   error
+}
+
+// loadDoctorCacheCmd produces a tea.Cmd that reads the on-disk
+// doctor cache (if any) off the hot path and emits a
+// doctorCacheLoadedMsg. Safe to invoke at any time; it's a
+// single-file read with no network calls.
+func (m *Model) loadDoctorCacheCmd() tea.Cmd {
+	dataDir := ""
+	if m.cfg != nil {
+		dataDir = m.cfg.DataDir
+	}
+	return func() tea.Msg {
+		c, err := LoadDoctorCache(dataDir)
+		return doctorCacheLoadedMsg{Cache: c, Err: err}
+	}
 }
 
 func tickSpin() tea.Cmd {
@@ -295,9 +346,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.plugins.loaded && !m.plugins.loading {
 			postCmds = append(postCmds, m.plugins.LoadCmd())
 		}
+		// P3-#21: any successful `defenseclaw doctor` run writes
+		// the cache file from the CLI side — re-read it so the
+		// Overview DOCTOR box reflects the new numbers without
+		// forcing the user to restart the TUI. A failing run
+		// (ExitCode != 0) still updates the cache — doctor
+		// intentionally writes before exit — so we refresh
+		// regardless of the exit code.
+		if isDoctorCommand(msg.Command) {
+			postCmds = append(postCmds, m.loadDoctorCacheCmd())
+		}
 		if len(postCmds) > 0 {
 			return m, tea.Batch(postCmds...)
 		}
+		return m, nil
+
+	case doctorCacheLoadedMsg:
+		// Soft-fail: a NotExist is normal on first launch, and a
+		// parse error means the cache is corrupt — either way
+		// we just leave the Overview panel showing "not yet
+		// run" rather than crashing the TUI. For parse errors
+		// we surface a single toast so the operator knows to
+		// run doctor again.
+		if msg.Err != nil {
+			m.toasts.Push(ToastError, fmt.Sprintf("doctor cache: %v", msg.Err))
+			return m, nil
+		}
+		m.overview.SetDoctorCache(msg.Cache)
 		return m, nil
 
 	case InventoryLoadedMsg:
@@ -801,6 +876,8 @@ func (m Model) handlePanelScroll(delta int) (tea.Model, tea.Cmd) {
 		m.auditHist.ScrollBy(delta)
 	case PanelActivity:
 		m.activity.ScrollBy(delta)
+	case PanelTools:
+		m.tools.ScrollBy(delta)
 	case PanelSetup:
 		m.setup.ScrollBy(delta)
 	}
@@ -853,8 +930,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// If Setup has a form, wizard running, output visible, or field editing, let it consume keys
-	if m.activePanel == PanelSetup && (m.setup.editing || m.setup.wizFormEditing || m.setup.IsFormActive() || m.setup.IsWizardRunning() || len(m.setup.wizOutput) > 0) {
+	// If Setup has a form, wizard running, output visible, field
+	// editing, or the Audit Sinks editor is active, let it consume keys.
+	if m.activePanel == PanelSetup && (m.setup.editing || m.setup.wizFormEditing || m.setup.IsFormActive() || m.setup.IsWizardRunning() || len(m.setup.wizOutput) > 0 || m.setup.IsEditorActive()) {
 		return m.handleSetupKey(msg)
 	}
 
@@ -909,6 +987,14 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.activePanel = PanelAudit
 	case "0":
 		m.activePanel = PanelSetup
+	case "T":
+		// Tools panel has no numeric shortcut (see PanelTools
+		// comment in the enum). 'T' is uppercase to avoid clashing
+		// with the lowercase 't' most panels use for in-panel
+		// actions; it's mnemonic for the panel name.
+		if cmd := m.switchPanel(PanelTools); cmd != nil {
+			return m, cmd
+		}
 
 	case "tab":
 		if m.activePanel == PanelPolicy {
@@ -1063,6 +1149,11 @@ func (m Model) handleActionMenuKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m Model) executeActionMenuItem(key string) tea.Cmd {
 	switch m.activePanel {
 	case PanelSkills:
+		// All skill mutations route through `defenseclaw skill <verb>
+		// <name>` — the Python CLI owns admission, audit emission,
+		// and gateway RPC. Duplicating any of that in Go would give
+		// us a second source of truth that silently drifts (see the
+		// pre-P0-#4 ToggleBlock path that bypassed the CLI entirely).
 		sel := m.skills.Selected()
 		if sel == nil {
 			return nil
@@ -1080,19 +1171,34 @@ func (m Model) executeActionMenuItem(key string) tea.Cmd {
 			return m.executor.Execute("defenseclaw", []string{"skill", "unblock", sel.Name}, "unblock skill "+sel.Name)
 		case "d":
 			return m.executor.Execute("defenseclaw", []string{"skill", "disable", sel.Name}, "disable skill "+sel.Name)
+		case "e":
+			return m.executor.Execute("defenseclaw", []string{"skill", "enable", sel.Name}, "enable skill "+sel.Name)
 		case "q":
 			return m.executor.Execute("defenseclaw", []string{"skill", "quarantine", sel.Name}, "quarantine skill "+sel.Name)
 		case "r":
 			return m.executor.Execute("defenseclaw", []string{"skill", "restore", sel.Name}, "restore skill "+sel.Name)
+		case "n":
+			// `skill install` fetches from ClawHub (or local path if
+			// the CLI resolves it there). The TUI side doesn't need
+			// to care — we just pass the name and let cmd_skill.py
+			// decide.
+			return m.executor.Execute("defenseclaw", []string{"skill", "install", sel.Name}, "install skill "+sel.Name)
 		}
 	case PanelMCPs:
 		sel := m.mcps.Selected()
 		if sel == nil {
 			return nil
 		}
+		// Every key surfaced by MCPActions() must map to a CLI
+		// verb or the action menu will render "Info" as a button
+		// and then silently do nothing. Info is read-only so we
+		// route through the shell list rather than `mcp info` —
+		// the CLI doesn't have a per-server inspect command yet.
 		switch key {
 		case "s":
 			return m.executor.Execute("defenseclaw", []string{"mcp", "scan", sel.URL}, "scan mcp "+sel.URL)
+		case "i":
+			return m.executor.Execute("defenseclaw", []string{"mcp", "list"}, "list mcp")
 		case "b":
 			return m.executor.Execute("defenseclaw", []string{"mcp", "block", sel.URL}, "block mcp "+sel.URL)
 		case "a":
@@ -1101,6 +1207,77 @@ func (m Model) executeActionMenuItem(key string) tea.Cmd {
 			return m.executor.Execute("defenseclaw", []string{"mcp", "unblock", sel.URL}, "unblock mcp "+sel.URL)
 		case "x":
 			return m.executor.Execute("defenseclaw", []string{"mcp", "unset", sel.URL}, "unset mcp "+sel.URL)
+		}
+	case PanelPlugins:
+		// All plugin mutations route through the defenseclaw
+		// Python CLI so admission, runtime, and quarantine state
+		// stay coherent (see cli/defenseclaw/commands/cmd_plugin.py
+		// PolicyEngine.* calls). Never fork this state in Go — the
+		// CLI is the single source of truth.
+		sel := m.plugins.Selected()
+		if sel == nil {
+			return nil
+		}
+		// Prefer plugin name for user-facing commands since the
+		// CLI's block/allow/disable/enable/quarantine/restore
+		// resolve via _resolve_openclaw_plugin_id(name). Fall
+		// back to the ID when Name is blank (rare, e.g. manifests
+		// missing display fields).
+		name := sel.Name
+		if name == "" {
+			name = sel.ID
+		}
+		switch key {
+		case "s":
+			return m.executor.Execute("defenseclaw", []string{"plugin", "scan", name}, "scan plugin "+name)
+		case "i":
+			return m.executor.Execute("defenseclaw", []string{"plugin", "info", name}, "info plugin "+name)
+		case "b":
+			return m.executor.Execute("defenseclaw", []string{"plugin", "block", name}, "block plugin "+name)
+		case "a":
+			return m.executor.Execute("defenseclaw", []string{"plugin", "allow", name}, "allow plugin "+name)
+		case "u":
+			// "Unblock" in the action menu maps to `plugin allow`
+			// because that is the CLI verb that clears the block
+			// list and (if needed) re-enables the runtime (see
+			// cmd_plugin.allow → pe.allow + _enable_plugin_via_gateway).
+			return m.executor.Execute("defenseclaw", []string{"plugin", "allow", name}, "unblock plugin "+name)
+		case "d":
+			return m.executor.Execute("defenseclaw", []string{"plugin", "disable", name}, "disable plugin "+name)
+		case "e":
+			return m.executor.Execute("defenseclaw", []string{"plugin", "enable", name}, "enable plugin "+name)
+		case "q":
+			return m.executor.Execute("defenseclaw", []string{"plugin", "quarantine", name}, "quarantine plugin "+name)
+		case "r":
+			return m.executor.Execute("defenseclaw", []string{"plugin", "restore", name}, "restore plugin "+name)
+		case "x":
+			return m.executor.Execute("defenseclaw", []string{"plugin", "remove", name}, "remove plugin "+name)
+		}
+	case PanelTools:
+		// Tools mutations route through `defenseclaw tool` so the
+		// admission gate, scoped-policy resolution, and audit
+		// emission are handled by a single authoritative code
+		// path. Scope-qualified targets (e.g. `write_file@filesystem`)
+		// are preserved by passing `TargetName` verbatim — do not
+		// strip the scope or we'll end up editing the global row.
+		sel := m.tools.Selected()
+		if sel == nil {
+			return nil
+		}
+		target := sel.TargetName
+		if target == "" {
+			target = sel.Name
+		}
+		display := target
+		switch key {
+		case "i":
+			return m.executor.Execute("defenseclaw", []string{"tool", "status", target}, "info tool "+display)
+		case "b":
+			return m.executor.Execute("defenseclaw", []string{"tool", "block", target}, "block tool "+display)
+		case "a":
+			return m.executor.Execute("defenseclaw", []string{"tool", "allow", target}, "allow tool "+display)
+		case "u":
+			return m.executor.Execute("defenseclaw", []string{"tool", "unblock", target}, "unblock tool "+display)
 		}
 	}
 	return nil
@@ -1220,6 +1397,8 @@ func (m Model) handlePanelKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handleAuditKey(msg)
 	case PanelActivity:
 		return m.handleActivityKey(msg)
+	case PanelTools:
+		return m.handleToolsKey(msg)
 	case PanelSetup:
 		return m.handleSetupKey(msg)
 	}
@@ -1238,8 +1417,10 @@ func (m Model) handlePolicyKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleSetupKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 
-	// Global setup shortcuts (not when editing, form active, or running a wizard)
-	if !m.setup.editing && !m.setup.IsFormActive() && !m.setup.IsWizardRunning() && len(m.setup.wizOutput) == 0 {
+	// Global setup shortcuts (not when editing, form active, running a
+	// wizard, or inside the Audit Sinks editor — the editor owns 'R'/'E'
+	// and 'S' would unexpectedly save pending config changes).
+	if !m.setup.editing && !m.setup.IsFormActive() && !m.setup.IsWizardRunning() && len(m.setup.wizOutput) == 0 && !m.setup.IsEditorActive() {
 		switch key {
 		case "S":
 			if m.setup.HasChanges() {
@@ -1479,11 +1660,24 @@ func (m Model) handleSkillsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.actionMenu.Show(sel.Name, sel.Status, info, SkillActions(sel.Status))
 		}
 	case "b":
-		m.skills.ToggleBlock()
+		// Route through the CLI so block emits an audit event, runs
+		// the admission gate, and updates policy the same way a
+		// shell user would. Prior to P0-#4 this called
+		// m.skills.ToggleBlock() which bypassed all three.
+		if sel := m.skills.Selected(); sel != nil {
+			cmd := m.executor.Execute("defenseclaw", []string{"skill", "block", sel.Name}, "block skill "+sel.Name)
+			m.activePanel = PanelActivity
+			return m, cmd
+		}
 	case "a":
-		sel := m.skills.Selected()
-		if sel != nil && sel.Status == "blocked" {
-			m.skills.ToggleBlock()
+		// 'a' is always "allow" (block-list → allow-list → active is
+		// a one-way transition handled by `skill allow`). If the
+		// operator wants to unblock without allow-listing they can
+		// use 'u' from the action menu.
+		if sel := m.skills.Selected(); sel != nil {
+			cmd := m.executor.Execute("defenseclaw", []string{"skill", "allow", sel.Name}, "allow skill "+sel.Name)
+			m.activePanel = PanelActivity
+			return m, cmd
 		}
 	case "s":
 		if sel := m.skills.Selected(); sel != nil {
@@ -1498,6 +1692,20 @@ func (m Model) handleSkillsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleMCPsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// The Set form owns the keyboard while it's open — route
+	// everything through it. On submit it emits (binary, args) and
+	// the caller dispatches through CommandExecutor so the MCP
+	// `set` verb runs out-of-process (matching every other
+	// mutation in this panel).
+	if m.mcpSetForm.IsActive() {
+		submit, bin, args, display := m.mcpSetForm.HandleKey(msg.String())
+		if submit {
+			m.mcpSetForm.Close()
+			m.activePanel = PanelActivity
+			return m, m.executor.Execute(bin, args, display)
+		}
+		return m, nil
+	}
 	switch msg.String() {
 	case "j", "down":
 		m.mcps.CursorDown()
@@ -1521,11 +1729,27 @@ func (m Model) handleMCPsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.actionMenu.Show(sel.URL, sel.Status, info, MCPActions(sel.Status))
 		}
 	case "b":
-		m.mcps.ToggleBlock()
+		// Pre-P0-#5 this called ToggleBlock() which mutated the
+		// local audit store only. That bypasses the admission gate,
+		// the gateway RPC, and the formal audit event — so a block
+		// from the TUI looked different in the log than a block from
+		// the shell. Now every mutation routes through the Python
+		// CLI, which is the single source of truth for policy.
+		if sel := m.mcps.Selected(); sel != nil {
+			cmd := m.executor.Execute("defenseclaw", []string{"mcp", "block", sel.URL}, "block mcp "+sel.URL)
+			m.activePanel = PanelActivity
+			return m, cmd
+		}
 	case "a":
-		sel := m.mcps.Selected()
-		if sel != nil && sel.Status == "blocked" {
-			m.mcps.ToggleBlock()
+		// 'a' always means "allow". The old "only if blocked"
+		// short-circuit was a footgun — operators watching a row go
+		// from blocked→allowed wanted the full allow-list entry,
+		// not an unblock-and-stop. Unblock is still reachable via
+		// 'u' in the action menu.
+		if sel := m.mcps.Selected(); sel != nil {
+			cmd := m.executor.Execute("defenseclaw", []string{"mcp", "allow", sel.URL}, "allow mcp "+sel.URL)
+			m.activePanel = PanelActivity
+			return m, cmd
 		}
 	case "s":
 		if sel := m.mcps.Selected(); sel != nil {
@@ -1533,6 +1757,12 @@ func (m Model) handleMCPsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.activePanel = PanelActivity
 			return m, cmd
 		}
+	case "n", "+":
+		// Open the MCP Set form. The form owns its own state and
+		// on submit dispatches `defenseclaw mcp set <name> ...`.
+		// 'n' mirrors "new" (parity with skill install), '+' is a
+		// convenience alias for keyboards that preserve shift.
+		m.mcpSetForm.Open("")
 	case "r":
 		m.mcps.Refresh()
 	}
@@ -1559,16 +1789,85 @@ func (m Model) handlePluginsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.activePanel = PanelActivity
 			return m, cmd
 		}
+	case "o":
+		// Open the contextual action menu. Parity with Skills/MCPs
+		// (both use 'o'). The action menu dispatches via
+		// executeActionMenuItem → `defenseclaw plugin <verb> <name>`,
+		// routing mutations through the CLI so PolicyEngine,
+		// admission audit, and gateway RPC stay in one place.
+		if sel := m.plugins.Selected(); sel != nil {
+			name := sel.Name
+			if name == "" {
+				name = sel.ID
+			}
+			info := [][2]string{
+				{"ID", sel.ID},
+				{"Version", sel.Version},
+				{"Origin", sel.Origin},
+				{"Status", sel.Status},
+				{"Verdict", sel.Verdict},
+			}
+			if sel.Scan != nil {
+				info = append(info,
+					[2]string{"Max severity", sel.Scan.MaxSeverity},
+					[2]string{"Findings", fmt.Sprintf("%d", sel.Scan.TotalFindings)},
+				)
+			}
+			m.actionMenu.SetSize(m.width, m.height)
+			m.actionMenu.Show(name, sel.Status, info, PluginActions(sel.Verdict, sel.Status, sel.Enabled))
+		}
+	}
+	return m, nil
+}
+
+// handleToolsKey handles key input while the Tools panel is active.
+// Keybindings mirror Skills/MCPs (j/k nav, enter for detail, o for
+// the action menu, r to refresh) so operators get the same ergonomics
+// across block-list panels. No filter support yet — the tool list is
+// typically short (rules, not inventory), so a dedicated filter UI
+// doesn't earn its keep until operator feedback tells us otherwise.
+func (m Model) handleToolsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "j", "down":
+		m.tools.CursorDown()
+	case "k", "up":
+		m.tools.CursorUp()
+	case "esc":
+		if m.tools.IsDetailOpen() {
+			m.tools.ToggleDetail()
+		}
+	case "enter":
+		m.tools.ToggleDetail()
+	case "r":
+		m.tools.Refresh()
+	case "o":
+		if sel := m.tools.Selected(); sel != nil {
+			scope := sel.Scope
+			if scope == "" {
+				scope = "(global)"
+			}
+			info := [][2]string{
+				{"Scope", scope},
+				{"Status", sel.Status},
+				{"Since", sel.Time},
+			}
+			if sel.Reason != "" {
+				info = append(info, [2]string{"Reason", sel.Reason})
+			}
+			m.actionMenu.SetSize(m.width, m.height)
+			m.actionMenu.Show(sel.Name, sel.Status, info, ToolActions(sel.Status))
+		}
 	}
 	return m, nil
 }
 
 func (m Model) handleLogsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
 	// On the Verdicts source, Enter opens a detail modal for the
 	// most-recent visible event. We intercept before handing the
 	// key to the panel so the panel's own "search entry" path
 	// doesn't swallow Enter while searching is inactive.
-	if msg.String() == "enter" && !m.logs.searching && m.logs.source == logSourceVerdicts {
+	if key == "enter" && !m.logs.searching && m.logs.source == logSourceVerdicts {
 		if row := m.logs.SelectedVerdict(); row != nil {
 			pairs := verdictDetailPairs(*row)
 			m.detail.SetSize(m.width, m.height)
@@ -1576,15 +1875,106 @@ func (m Model) handleLogsKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
+	// 'J' (capital — lowercase is used for "down" in the panel)
+	// opens the SQLite-backed Judge Response viewer. The panel
+	// gateway.jsonl tail shows only the last 2 KB of body; the
+	// SQLite copy preserves the full redacted response, the input
+	// hash, and the correlation IDs for forensic review. We pull
+	// the 20 most-recent rows because the detail modal is a simple
+	// kv renderer — pagination can come later once operators tell
+	// us the cap is too tight.
+	if key == "J" && !m.logs.searching && m.logs.source == logSourceVerdicts && m.store != nil {
+		rows, err := m.store.ListJudgeResponses(20)
+		m.detail.SetSize(m.width, m.height)
+		if err != nil {
+			m.detail.Show("Judge Responses — error", [][2]string{{"Error", err.Error()}})
+			return m, nil
+		}
+		if len(rows) == 0 {
+			m.detail.Show("Judge Responses", [][2]string{{"Info", "No judge responses persisted yet. Ensure guardrail.retain_judge_bodies is on (default) and traffic has been inspected."}})
+			return m, nil
+		}
+		m.detail.Show(fmt.Sprintf("Judge Responses — last %d", len(rows)), judgeResponsesDetailPairs(rows))
+		return m, nil
+	}
 	var cmd tea.Cmd
 	m.logs, cmd = m.logs.Update(msg)
 	return m, cmd
+}
+
+// judgeResponsesDetailPairs formats a slice of audit.JudgeResponse
+// rows into the label/value list the shared DetailModal expects.
+// The rows are laid out newest-first with a blank separator between
+// entries so long redacted bodies don't blur into each other. Each
+// row surfaces:
+//   - correlation keys (request_id, trace_id, run_id)
+//   - verdict shape (kind, action, severity, confidence, fail_closed)
+//   - performance (latency_ms)
+//   - inspected model vs judge model
+//   - the redacted raw body (truncated to 2 KB by the persistor)
+//
+// Anything that could contain PII is expected to already be
+// redacted before we reach this code path; we render the fields
+// verbatim.
+func judgeResponsesDetailPairs(rows []audit.JudgeResponse) [][2]string {
+	pairs := make([][2]string, 0, len(rows)*12)
+	for i, r := range rows {
+		if i > 0 {
+			pairs = append(pairs, [2]string{"", ""})
+		}
+		prefix := fmt.Sprintf("[%d] ", i+1)
+		pairs = append(pairs,
+			[2]string{prefix + "Timestamp", r.Timestamp.Format(time.RFC3339Nano)},
+			[2]string{prefix + "Kind", r.Kind},
+			[2]string{prefix + "Direction", r.Direction},
+			[2]string{prefix + "Action", r.Action},
+			[2]string{prefix + "Severity", r.Severity},
+			[2]string{prefix + "Latency (ms)", fmt.Sprintf("%d", r.LatencyMs)},
+		)
+		if r.InspectedModel != "" {
+			pairs = append(pairs, [2]string{prefix + "Inspected model", r.InspectedModel})
+		}
+		if r.Model != "" {
+			pairs = append(pairs, [2]string{prefix + "Judge model", r.Model})
+		}
+		if r.RequestID != "" {
+			pairs = append(pairs, [2]string{prefix + "Request ID", r.RequestID})
+		}
+		if r.TraceID != "" {
+			pairs = append(pairs, [2]string{prefix + "Trace ID", r.TraceID})
+		}
+		if r.RunID != "" {
+			pairs = append(pairs, [2]string{prefix + "Run ID", r.RunID})
+		}
+		if r.InputHash != "" {
+			pairs = append(pairs, [2]string{prefix + "Input hash", r.InputHash})
+		}
+		if r.Confidence != 0 {
+			pairs = append(pairs, [2]string{prefix + "Confidence", fmt.Sprintf("%.3f", r.Confidence)})
+		}
+		if r.FailClosedApplied {
+			pairs = append(pairs, [2]string{prefix + "Fail-closed", "yes"})
+		}
+		if r.PromptTemplateID != "" {
+			pairs = append(pairs, [2]string{prefix + "Prompt template", r.PromptTemplateID})
+		}
+		if r.ParseError != "" {
+			pairs = append(pairs, [2]string{prefix + "Parse error", r.ParseError})
+		}
+		pairs = append(pairs, [2]string{prefix + "Raw (redacted)", r.Raw})
+	}
+	return pairs
 }
 
 // verdictDetailPairs formats a structured event into the ordered
 // label/value pairs the shared DetailModal expects. Larger bodies
 // (judge raw response, error cause) come last so the modal can
 // scroll without hiding the identification block.
+//
+// Fields are grouped by intent so operators can read the modal like
+// an incident report: identification → correlation → verdict →
+// judge details → lifecycle/error/diagnostic → raw JSON escape
+// hatch.
 func verdictDetailPairs(r verdictRow) [][2]string {
 	pairs := [][2]string{
 		{"Timestamp", r.timestamp.Format(time.RFC3339Nano)},
@@ -1595,12 +1985,116 @@ func verdictDetailPairs(r verdictRow) [][2]string {
 		{"Direction", r.direction},
 		{"Model", r.model},
 	}
+
+	// Correlation IDs — the whole point of request_id/run_id is to
+	// let an operator pivot from the TUI into SQLite, Splunk, or an
+	// OTel trace view. Surface them right after identification so
+	// they're never more than a skim away.
+	if r.provider != "" {
+		pairs = append(pairs, [2]string{"Provider", r.provider})
+	}
+	if r.requestID != "" {
+		pairs = append(pairs, [2]string{"Request ID", r.requestID})
+	}
+	if r.runID != "" {
+		pairs = append(pairs, [2]string{"Run ID", r.runID})
+	}
+	if r.sessionID != "" {
+		pairs = append(pairs, [2]string{"Session ID", r.sessionID})
+	}
+
+	// Verdict-specific extras — only surface when non-empty so a
+	// lifecycle/error modal doesn't show "Categories: " with an
+	// empty right-hand side.
+	if len(r.categories) > 0 {
+		pairs = append(pairs, [2]string{"Categories", strings.Join(r.categories, ", ")})
+	}
+	if r.latencyMs > 0 {
+		pairs = append(pairs, [2]string{"Latency (ms)", fmt.Sprintf("%d", r.latencyMs)})
+	}
 	if r.kind != "" {
 		pairs = append(pairs, [2]string{"Judge kind", r.kind})
 	}
 	if r.reason != "" {
 		pairs = append(pairs, [2]string{"Reason", r.reason})
 	}
+
+	// Judge-specific fields — the envelope severity already shows
+	// up above as "Severity"; show the judge's own severity only
+	// when it disagrees, to avoid visual duplication.
+	if r.judgeSeverity != "" && !strings.EqualFold(r.judgeSeverity, r.severity) {
+		pairs = append(pairs, [2]string{"Judge severity", r.judgeSeverity})
+	}
+	if r.judgeInputBytes > 0 {
+		pairs = append(pairs, [2]string{"Judge input bytes", fmt.Sprintf("%d", r.judgeInputBytes)})
+	}
+	if r.judgeParseError != "" {
+		pairs = append(pairs, [2]string{"Judge parse error", r.judgeParseError})
+	}
+	for i, f := range r.judgeFindings {
+		label := fmt.Sprintf("Finding %d", i+1)
+		val := fmt.Sprintf("category=%s severity=%s", f.Category, f.Severity)
+		if f.Rule != "" {
+			val += " rule=" + f.Rule
+		}
+		if f.Source != "" {
+			val += " source=" + f.Source
+		}
+		if f.Conf > 0 {
+			val += fmt.Sprintf(" conf=%.2f", f.Conf)
+		}
+		pairs = append(pairs, [2]string{label, val})
+	}
+
+	// Lifecycle, error, diagnostic payload details. Operators open
+	// lifecycle events to see "what subsystem transitioned and
+	// why"; error events to see code+message+cause; diagnostic to
+	// see component+message.
+	if r.lifecycleSubsystem != "" {
+		pairs = append(pairs, [2]string{"Subsystem", r.lifecycleSubsystem})
+	}
+	if r.lifecycleTransition != "" {
+		pairs = append(pairs, [2]string{"Transition", r.lifecycleTransition})
+	}
+	if len(r.lifecycleDetails) > 0 {
+		// Stable alphabetical ordering — same contract as the
+		// inline renderer — so the modal doesn't shuffle between
+		// opens.
+		keys := make([]string, 0, len(r.lifecycleDetails))
+		for k := range r.lifecycleDetails {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			pairs = append(pairs, [2]string{"Detail: " + k, r.lifecycleDetails[k]})
+		}
+	}
+	if r.errorSubsystem != "" {
+		pairs = append(pairs, [2]string{"Error subsystem", r.errorSubsystem})
+	}
+	if r.errorCode != "" {
+		pairs = append(pairs, [2]string{"Error code", r.errorCode})
+	}
+	if r.errorMessage != "" {
+		pairs = append(pairs, [2]string{"Error message", r.errorMessage})
+	}
+	if r.errorCause != "" {
+		pairs = append(pairs, [2]string{"Error cause", r.errorCause})
+	}
+	if r.diagnosticComponent != "" {
+		pairs = append(pairs, [2]string{"Diagnostic component", r.diagnosticComponent})
+	}
+	if r.diagnosticMessage != "" {
+		pairs = append(pairs, [2]string{"Diagnostic message", r.diagnosticMessage})
+	}
+
+	// Judge raw response is intentionally one of the last fields
+	// because it's usually the largest string in the modal and
+	// pushes higher-signal correlation IDs off-screen otherwise.
+	if r.judgeRaw != "" {
+		pairs = append(pairs, [2]string{"Judge raw response", r.judgeRaw})
+	}
+
 	pairs = append(pairs, [2]string{"Raw JSON", r.raw})
 	return pairs
 }
@@ -1664,6 +2158,14 @@ func (m Model) handleInventoryKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.openInventoryDetail()
 	case "r":
 		return m, m.inventory.LoadCmd()
+	case "o":
+		// P3-#19: 'o' toggles the fast-scan preset (skills+
+		// plugins+mcp) that maps to `defenseclaw aibom scan
+		// --only skills,plugins,mcp`. Not auto-reloading — the
+		// operator presses 'r' next to trigger the scan so
+		// they can see the new scope before paying the 15-30s
+		// cost.
+		m.inventory.ToggleFastScan()
 	}
 	return m, nil
 }
@@ -1807,6 +2309,7 @@ func (m *Model) refresh() {
 	m.alerts.Refresh()
 	m.skills.Refresh()
 	m.mcps.Refresh()
+	m.tools.Refresh()
 	m.auditHist.Refresh()
 	if m.store != nil {
 		if err := m.overview.SetEnforcementCounts(m.store); err != nil {
@@ -1835,6 +2338,12 @@ func (m *Model) switchPanel(panel int) tea.Cmd {
 		if !m.plugins.loaded && !m.plugins.loading {
 			return m.plugins.LoadCmd()
 		}
+	case PanelTools:
+		// Tools loads synchronously off the audit store — no
+		// async load command needed. Refresh here so an operator
+		// jumping in via 'T' sees fresh rows even if the periodic
+		// refresh hasn't fired yet.
+		m.tools.Refresh()
 	}
 	return nil
 }
@@ -1847,6 +2356,7 @@ func (m *Model) resizePanels() {
 	m.alerts.SetSize(m.width, panelH)
 	m.skills.SetSize(m.width, panelH)
 	m.mcps.SetSize(m.width, panelH)
+	m.tools.SetSize(m.width, panelH)
 	m.detail.SetSize(m.width, m.height)
 	m.actionMenu.SetSize(m.width, m.height)
 	m.logs.SetSize(m.width, panelH)
@@ -2032,6 +2542,15 @@ func (m Model) renderActivePanel() string {
 	case PanelSkills:
 		return m.skills.View()
 	case PanelMCPs:
+		// The Set form is an overlay on the MCP panel — when it's
+		// open the operator is explicitly in "add / edit" mode and
+		// the list underneath would just be visual noise. We swap
+		// the whole panel render here (rather than post-composing
+		// in renderFrame) so the form gets the full height and the
+		// status bar continues to pick up MCP-panel hints.
+		if m.mcpSetForm.IsActive() {
+			return m.mcpSetForm.View()
+		}
 		return m.mcps.View()
 	case PanelPlugins:
 		return m.plugins.View(m.width, m.height-5)
@@ -2045,6 +2564,8 @@ func (m Model) renderActivePanel() string {
 		return m.auditHist.View(m.width, m.height-5)
 	case PanelActivity:
 		return m.activity.View()
+	case PanelTools:
+		return m.tools.View()
 	case PanelSetup:
 		return m.setup.View(m.width, m.height-5)
 	default:

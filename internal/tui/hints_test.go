@@ -103,8 +103,13 @@ func TestHintEngine(t *testing.T) {
 
 	t.Run("skills_normal", func(t *testing.T) {
 		hint := engine.HintForPanel(PanelSkills, SystemState{})
-		if !strings.Contains(hint, "navigate") {
-			t.Errorf("expected navigation hint, got: %s", hint)
+		// Post-P0-#4 the skills hint switched to the same
+		// nav/actions/scan shape as plugins. Assert the shape
+		// (nav · actions · scan) rather than a literal word so
+		// later wording tweaks don't force a test churn — but do
+		// pin "actions" so accidental truncation fails loudly.
+		if !strings.Contains(hint, "actions") || !strings.Contains(hint, "scan") {
+			t.Errorf("expected skills hint to mention actions+scan, got: %s", hint)
 		}
 	})
 
@@ -117,8 +122,12 @@ func TestHintEngine(t *testing.T) {
 
 	t.Run("plugins_normal", func(t *testing.T) {
 		hint := engine.HintForPanel(PanelPlugins, SystemState{})
-		if !strings.Contains(hint, "Plugins") || !strings.Contains(hint, "tools") {
-			t.Errorf("expected plugins hint, got: %s", hint)
+		// Must surface the actions shortcut (PluginActions menu is
+		// the whole point of P0-#2) and at least one verb so
+		// operators know what `o` unlocks without reading the
+		// source.
+		if !strings.Contains(hint, "actions") || !strings.Contains(hint, "scan") {
+			t.Errorf("expected plugins hint to advertise 'actions' shortcut and scan verb, got: %s", hint)
 		}
 	})
 

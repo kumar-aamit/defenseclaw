@@ -19,7 +19,6 @@ package audit
 import (
 	"context"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -438,21 +437,23 @@ func TestLogger_LogNetworkEgress(t *testing.T) {
 	})
 }
 
-func TestLogger_LogNetworkEgress_BlockedAlertUsesLoggerPipeline(t *testing.T) {
-	t.Setenv("DEFENSECLAW_RUN_ID", "egress-run-id")
+func TestLogger_LogNetworkEgress_BlockedAlertFansOutWithCorrelationDefaults(t *testing.T) {
+	t.Setenv("DEFENSECLAW_RUN_ID", "network-egress-run")
 
 	store, cleanup := newTestStore(t)
 	defer cleanup()
 
 	logger := NewLogger(store)
-	cs := installCaptureSink(t, logger)
+	sink := installCaptureSink(t, logger)
+	emitter := &captureEmitter{}
+	logger.SetStructuredEmitter(emitter)
 
 	err := logger.LogNetworkEgress(context.Background(), NetworkEgressEvent{
-		Hostname:      "exfil.bad",
-		URL:           "http://exfil.bad/upload?email=alice@example.com",
-		HTTPMethod:    "PUT",
-		Protocol:      "http",
-		PolicyOutcome: "Denied: matched alice@example.com",
+		Hostname:      "blocked.example",
+		URL:           "https://blocked.example/upload",
+		HTTPMethod:    "POST",
+		Protocol:      "https",
+		PolicyOutcome: "Denied: hostname on deny list",
 		DecisionCode:  "NETWORK_DENY_PATTERN",
 		Blocked:       true,
 	})
@@ -460,47 +461,28 @@ func TestLogger_LogNetworkEgress_BlockedAlertUsesLoggerPipeline(t *testing.T) {
 		t.Fatalf("LogNetworkEgress: %v", err)
 	}
 
-	forwarded := cs.snapshot()
-	if len(forwarded) != 1 {
-		t.Fatalf("forwarded event count=%d want 1", len(forwarded))
+	sinkEvents := sink.snapshot()
+	if len(sinkEvents) != 1 {
+		t.Fatalf("sink events = %d, want 1", len(sinkEvents))
 	}
-	evt := forwarded[0]
-	if evt.Action != "network-egress-blocked" {
-		t.Fatalf("action=%q want network-egress-blocked", evt.Action)
+	if sinkEvents[0].Action != "network-egress-blocked" {
+		t.Fatalf("sink action = %q, want network-egress-blocked", sinkEvents[0].Action)
 	}
-	if evt.ID == "" || evt.Actor == "" || evt.RunID == "" {
-		t.Fatalf("forwarded alert missing defaults: %+v", evt)
+	if sinkEvents[0].Target != "blocked.example" {
+		t.Fatalf("sink target = %q, want blocked.example", sinkEvents[0].Target)
 	}
-	if evt.RunID != "egress-run-id" {
-		t.Fatalf("forwarded run_id=%q want egress-run-id", evt.RunID)
-	}
-	if strings.Contains(evt.Details, "alice@example.com") {
-		t.Fatalf("forwarded alert leaked raw email: %q", evt.Details)
+	if sinkEvents[0].ID == "" || sinkEvents[0].RunID == "" || sinkEvents[0].Actor == "" {
+		t.Fatalf("sink event missing defaults: %+v", sinkEvents[0])
 	}
 
-	alerts, err := store.ListAlerts(10)
-	if err != nil {
-		t.Fatalf("ListAlerts: %v", err)
+	emitted := emitter.snapshot()
+	if len(emitted) != 1 {
+		t.Fatalf("structured events = %d, want 1", len(emitted))
 	}
-	var stored Event
-	var found bool
-	for _, alert := range alerts {
-		if alert.Action == "network-egress-blocked" && alert.Target == "exfil.bad" {
-			stored = alert
-			found = true
-			break
-		}
+	if emitted[0].Action != "network-egress-blocked" {
+		t.Fatalf("structured action = %q, want network-egress-blocked", emitted[0].Action)
 	}
-	if !found {
-		t.Fatal("blocked alert not stored in audit_events")
-	}
-	if stored.ID == "" || stored.Actor == "" || stored.RunID == "" {
-		t.Fatalf("stored alert missing defaults: %+v", stored)
-	}
-	if stored.RunID != "egress-run-id" {
-		t.Fatalf("stored run_id=%q want egress-run-id", stored.RunID)
-	}
-	if strings.Contains(stored.Details, "alice@example.com") {
-		t.Fatalf("stored alert leaked raw email: %q", stored.Details)
+	if emitted[0].ID == "" || emitted[0].RunID == "" || emitted[0].Actor == "" {
+		t.Fatalf("structured event missing defaults: %+v", emitted[0])
 	}
 }

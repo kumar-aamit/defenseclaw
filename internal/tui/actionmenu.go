@@ -147,7 +147,22 @@ func (m *ActionMenu) View() string {
 	return modal
 }
 
-// SkillActions returns the action items for a skill based on its current status.
+// SkillActions returns the action items for a skill based on its
+// current status. Every key here must map to a real CLI verb in
+// executeActionMenuItem's PanelSkills case or the menu silently
+// no-ops on the operator (see TestExecuteActionMenuItem_SkillDispatch).
+//
+// Branch rules:
+//   - "blocked":     unblock / allow to move out of the block list.
+//   - "allowed":     block / disable. Quarantine doesn't belong here
+//                    because an allow-listed skill is intentionally
+//                    kept around; quarantine implies "make it go away".
+//   - "quarantined": restore (only valid CLI path out of quarantine).
+//   - "disabled":    enable to re-arm at runtime.
+//   - default:       block / allow / disable / quarantine / install.
+//     Install is offered to cover the case where `skill list` shows
+//     a known-but-not-installed row so operators can pull it in from
+//     ClawHub without dropping to the shell.
 func SkillActions(status string) []ActionItem {
 	actions := []ActionItem{
 		{Key: "s", Label: "Scan", Description: "Run security scan"},
@@ -158,10 +173,20 @@ func SkillActions(status string) []ActionItem {
 	case "blocked":
 		actions = append(actions,
 			ActionItem{Key: "u", Label: "Unblock", Description: "Remove from block list"},
-			ActionItem{Key: "r", Label: "Restore", Description: "Restore if quarantined"},
+			ActionItem{Key: "a", Label: "Allow", Description: "Pin as allow-listed"},
 		)
 	case "allowed":
 		actions = append(actions,
+			ActionItem{Key: "b", Label: "Block", Description: "Add to block list"},
+			ActionItem{Key: "d", Label: "Disable", Description: "Disable at runtime"},
+		)
+	case "quarantined":
+		actions = append(actions,
+			ActionItem{Key: "r", Label: "Restore", Description: "Restore from quarantine"},
+		)
+	case "disabled":
+		actions = append(actions,
+			ActionItem{Key: "e", Label: "Enable", Description: "Enable at runtime"},
 			ActionItem{Key: "b", Label: "Block", Description: "Add to block list"},
 		)
 	default:
@@ -170,9 +195,125 @@ func SkillActions(status string) []ActionItem {
 			ActionItem{Key: "a", Label: "Allow", Description: "Add to allow list"},
 			ActionItem{Key: "d", Label: "Disable", Description: "Disable at runtime"},
 			ActionItem{Key: "q", Label: "Quarantine", Description: "Move to quarantine"},
+			ActionItem{Key: "n", Label: "Install", Description: "Install via ClawHub"},
 		)
 	}
 
+	return actions
+}
+
+// PluginActions returns the action items for a plugin based on its
+// current verdict, runtime enabled-state, and coarse status string.
+//
+// Visibility rules mirror the CLI surface in cli/defenseclaw/commands/
+// cmd_plugin.py so operators can execute any supported mutation from
+// the TUI without dropping to a shell:
+//
+//   - scan + info are always available (read-only introspection)
+//   - block / unblock are driven by verdict (defense-in-depth: the
+//     status field alone can lag behind admission changes)
+//   - allow is offered whenever the plugin is not already allowed
+//   - enable / disable mirror runtime state (gateway RPC)
+//   - quarantine is gated so we never offer it on an already-quarantined
+//     plugin; restore is only shown when status reports quarantine
+//   - remove is always last and destructive — surface it explicitly
+//     instead of hiding it behind a confirmation modal the operator
+//     must discover
+//
+// Extra arguments (e.g. --reason) are not handled here — the executor
+// shells out with just the plugin name and relies on the CLI's
+// default-reason fallback. If we add a reason-prompt in future it
+// should live in a follow-up form, not inline action args.
+func PluginActions(verdict, status string, enabled bool) []ActionItem {
+	actions := []ActionItem{
+		{Key: "s", Label: "Scan", Description: "Run security scan"},
+		{Key: "i", Label: "Info", Description: "Show full details"},
+	}
+
+	// Block / unblock is driven by verdict because the admission
+	// gate applies before runtime state changes — a plugin can be
+	// "blocked" but still technically "enabled" on disk until the
+	// gateway reloads.
+	switch verdict {
+	case "blocked":
+		actions = append(actions,
+			ActionItem{Key: "u", Label: "Unblock", Description: "Remove from block list (runs plugin allow)"},
+		)
+	case "allowed":
+		actions = append(actions,
+			ActionItem{Key: "b", Label: "Block", Description: "Add to install block list"},
+		)
+	default:
+		actions = append(actions,
+			ActionItem{Key: "b", Label: "Block", Description: "Add to install block list"},
+			ActionItem{Key: "a", Label: "Allow", Description: "Add to install allow list"},
+		)
+	}
+
+	// Runtime enable/disable via gateway RPC. Surfaces regardless of
+	// verdict — an allowed-and-enabled plugin is still disable-able.
+	if enabled {
+		actions = append(actions,
+			ActionItem{Key: "d", Label: "Disable", Description: "Disable at runtime (gateway RPC)"},
+		)
+	} else {
+		actions = append(actions,
+			ActionItem{Key: "e", Label: "Enable", Description: "Enable at runtime (gateway RPC)"},
+		)
+	}
+
+	// Quarantine / restore are driven off status because that's where
+	// the PluginEnforcer records quarantine state in the audit
+	// store (see plugin_enforcer.is_quarantined).
+	if strings.Contains(strings.ToLower(status), "quarantine") {
+		actions = append(actions,
+			ActionItem{Key: "r", Label: "Restore", Description: "Restore from quarantine"},
+		)
+	} else {
+		actions = append(actions,
+			ActionItem{Key: "q", Label: "Quarantine", Description: "Move files to quarantine dir"},
+		)
+	}
+
+	actions = append(actions,
+		ActionItem{Key: "x", Label: "Remove", Description: "Delete plugin files from disk"},
+	)
+
+	return actions
+}
+
+// ToolActions returns the action items for a tool-policy row (a
+// `tool.<name>` or `tool.<name>@<scope>` action entry) based on the
+// current Install decision recorded by the admission gate.
+//
+// The surface is deliberately narrower than Skills/MCPs/Plugins:
+// tools don't have a scanner of their own — their provenance is the
+// owning skill or MCP server, so "scan" would be a no-op. Tools also
+// don't have a runtime enable/disable toggle (that's modelled at the
+// skill/MCP layer). What remains is the install-gate outcome:
+// block / allow / unblock. The key map intentionally matches
+// SkillActions/PluginActions (b/a/u + i) so muscle memory carries over.
+func ToolActions(status string) []ActionItem {
+	actions := []ActionItem{
+		{Key: "i", Label: "Info", Description: "Show full details"},
+	}
+	switch status {
+	case "blocked":
+		actions = append(actions,
+			ActionItem{Key: "u", Label: "Unblock", Description: "Remove from block/allow list"},
+			ActionItem{Key: "a", Label: "Allow", Description: "Pin as allow-listed"},
+		)
+	case "allowed":
+		actions = append(actions,
+			ActionItem{Key: "u", Label: "Unblock", Description: "Remove from block/allow list"},
+			ActionItem{Key: "b", Label: "Block", Description: "Add to tool block list"},
+		)
+	default:
+		actions = append(actions,
+			ActionItem{Key: "b", Label: "Block", Description: "Add to tool block list"},
+			ActionItem{Key: "a", Label: "Allow", Description: "Pin as allow-listed"},
+		)
+	}
 	return actions
 }
 

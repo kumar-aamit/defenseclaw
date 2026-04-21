@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"github.com/defenseclaw/defenseclaw/internal/audit/sinks"
-	"github.com/defenseclaw/defenseclaw/internal/gatewaylog"
 	"github.com/defenseclaw/defenseclaw/internal/scanner"
 )
 
@@ -227,96 +226,6 @@ func TestLoggerSinkForwardingIncludesDefaultedFields(t *testing.T) {
 	}
 	if evt.Action != "skill-block" || evt.Target != "test-skill" {
 		t.Fatalf("forwarded event mismatch: %+v", evt)
-	}
-}
-
-func TestLoggerForwardGatewayEvent_ForwardsStructuredPayload(t *testing.T) {
-	store, err := NewStore(filepath.Join(t.TempDir(), "audit.db"))
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	defer store.Close()
-	if err := store.Init(); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-
-	logger := NewLogger(store)
-	cs := installCaptureSink(t, logger)
-
-	logger.ForwardGatewayEvent(gatewaylog.Event{
-		Timestamp: time.Now().UTC(),
-		EventType: gatewaylog.EventVerdict,
-		Severity:  gatewaylog.SeverityHigh,
-		Model:     "gpt-4",
-		RunID:     "run-123",
-		Verdict: &gatewaylog.VerdictPayload{
-			Stage:  gatewaylog.StageFinal,
-			Action: "block",
-			Reason: "matched: SEC-AWS:<redacted-pii sha256:abc123>",
-		},
-	})
-	logger.Close()
-
-	got := cs.snapshot()
-	if len(got) != 1 {
-		t.Fatalf("forwarded event count=%d want 1", len(got))
-	}
-	evt := got[0]
-	if evt.Action != "gateway-verdict" {
-		t.Fatalf("action=%q want gateway-verdict", evt.Action)
-	}
-	if evt.Target != "gpt-4" {
-		t.Fatalf("target=%q want gpt-4", evt.Target)
-	}
-	if evt.Actor != "defenseclaw-gateway" {
-		t.Fatalf("actor=%q want defenseclaw-gateway", evt.Actor)
-	}
-	if evt.RunID != "run-123" {
-		t.Fatalf("run_id=%q want run-123", evt.RunID)
-	}
-	if evt.Structured["event_type"] != "verdict" {
-		t.Fatalf("structured event_type=%v want verdict", evt.Structured["event_type"])
-	}
-	verdict, ok := evt.Structured["verdict"].(map[string]any)
-	if !ok {
-		t.Fatalf("structured verdict payload missing: %#v", evt.Structured)
-	}
-	if verdict["action"] != "block" {
-		t.Fatalf("structured verdict action=%v want block", verdict["action"])
-	}
-	if !strings.Contains(evt.Details, "stage=final") {
-		t.Fatalf("details=%q missing stage summary", evt.Details)
-	}
-}
-
-func TestLoggerForwardGatewayEvent_ImmediateFlushForGatewayVerdict(t *testing.T) {
-	store, err := NewStore(filepath.Join(t.TempDir(), "audit.db"))
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	defer store.Close()
-	if err := store.Init(); err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-
-	logger := NewLogger(store)
-	cs := installCaptureSink(t, logger)
-
-	logger.ForwardGatewayEvent(gatewaylog.Event{
-		Timestamp: time.Now().UTC(),
-		EventType: gatewaylog.EventVerdict,
-		Severity:  gatewaylog.SeverityHigh,
-		Verdict: &gatewaylog.VerdictPayload{
-			Stage:  gatewaylog.StageFinal,
-			Action: "block",
-		},
-	})
-
-	deadline := time.After(2 * time.Second)
-	select {
-	case <-cs.immediateFlushC:
-	case <-deadline:
-		t.Fatal("expected gateway-verdict to trigger immediate sink flush")
 	}
 }
 
@@ -620,5 +529,96 @@ func TestLoggerRedactsFindingFieldsBeforeSQLite(t *testing.T) {
 	}
 	if f.Title != "PII detected" {
 		t.Fatalf("Title should be preserved verbatim; got %q", f.Title)
+	}
+}
+
+// TestLoggerLogActionWithCorrelation_PersistsRequestID asserts that
+// a request_id supplied by the guardrail request path flows all the
+// way to SQLite and to the sinks.Manager fan-out — the end-to-end
+// contract for Phase 5.
+func TestLoggerLogActionWithCorrelation_PersistsRequestID(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	logger := NewLogger(store)
+	cs := installCaptureSink(t, logger)
+
+	const (
+		traceID = "00-1234567890abcdef1234567890abcdef-0102030405060708-01"
+		reqID   = "req-phase5-abcdef"
+	)
+	if err := logger.LogActionWithCorrelation("guardrail-verdict", "gpt-5",
+		"direction=prompt action=block severity=HIGH", traceID, reqID); err != nil {
+		t.Fatalf("LogActionWithCorrelation: %v", err)
+	}
+	logger.Close()
+
+	events, err := store.ListEvents(10)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].TraceID != traceID {
+		t.Fatalf("SQLite trace_id = %q, want %q", events[0].TraceID, traceID)
+	}
+	if events[0].RequestID != reqID {
+		t.Fatalf("SQLite request_id = %q, want %q", events[0].RequestID, reqID)
+	}
+
+	snap := cs.snapshot()
+	if len(snap) != 1 {
+		t.Fatalf("expected 1 forwarded event, got %d", len(snap))
+	}
+	if snap[0].RequestID != reqID {
+		t.Fatalf("sink request_id = %q, want %q", snap[0].RequestID, reqID)
+	}
+	if snap[0].TraceID != traceID {
+		t.Fatalf("sink trace_id = %q, want %q", snap[0].TraceID, traceID)
+	}
+}
+
+// TestLoggerLogActionWithTrace_EmptyRequestIDIsLegal asserts that the
+// legacy LogActionWithTrace path still works when the request_id is
+// not known (e.g., the file-watcher subsystem has no HTTP
+// correlation context). The row must land in SQLite with an empty
+// request_id and the sink fan-out must not panic.
+func TestLoggerLogActionWithTrace_EmptyRequestIDIsLegal(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "audit.db"))
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	logger := NewLogger(store)
+	cs := installCaptureSink(t, logger)
+
+	if err := logger.LogActionWithTrace("watch-start", "", "dirs=3", ""); err != nil {
+		t.Fatalf("LogActionWithTrace: %v", err)
+	}
+	logger.Close()
+
+	events, err := store.ListEvents(10)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].RequestID != "" {
+		t.Fatalf("empty request_id should persist as empty; got %q", events[0].RequestID)
+	}
+	if snap := cs.snapshot(); len(snap) != 1 || snap[0].RequestID != "" {
+		t.Fatalf("sink should have empty request_id; got %+v", snap)
 	}
 }

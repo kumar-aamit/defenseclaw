@@ -81,6 +81,8 @@ func (h *HintEngine) HintForPanel(panel int, state SystemState) string {
 		return h.auditHint(state)
 	case PanelActivity:
 		return h.activityHint(state)
+	case PanelTools:
+		return h.toolsHint(state)
 	default:
 		return "Press : or Ctrl+K to open the command palette. Press ? for help."
 	}
@@ -125,19 +127,26 @@ func (h *HintEngine) skillsHint(state SystemState) string {
 	if state.UnscannedSkills > 0 {
 		return fmt.Sprintf("%d skills unscanned. Press \"s\" on a skill to scan, or : then \"scan skill --all\".", state.UnscannedSkills)
 	}
-	return "j/k to navigate, Enter for actions menu, \"s\" to scan, \"b\" to block, \"a\" to allow."
+	return "j/k nav · o actions (block/allow/disable/enable/quarantine/restore/install) · s scan · r refresh · Enter detail."
 }
 
 func (h *HintEngine) mcpsHint(_ SystemState) string {
-	return "j/k to navigate, Enter for actions menu, \"s\" to scan, \"b\" to block, \"a\" to allow."
+	return "j/k nav · o actions (block/allow/unblock/unset) · s scan · n add server · r refresh · Enter detail."
 }
 
 func (h *HintEngine) pluginsHint(_ SystemState) string {
-	return "j/k to navigate, Enter for actions menu. Plugins provide tools and hooks to OpenClaw agents."
+	return "j/k nav · o actions (scan/block/allow/disable/enable/quarantine/restore/remove) · s scan · r refresh · Enter details."
+}
+
+// toolsHint is the one-line guide at the bottom of the Tools panel.
+// Keep it action-first: tools are a policy-mutation surface, so the
+// hint tells operators what keys exist rather than what a tool is.
+func (h *HintEngine) toolsHint(_ SystemState) string {
+	return "j/k nav · o actions (block/allow/unblock) · r refresh · Enter detail · : tool block <name>."
 }
 
 func (h *HintEngine) inventoryHint(_ SystemState) string {
-	return "Left/Right to switch sub-tabs (Skills, Plugins, MCPs, Agents, Models, Tools, Memory). \"r\" to refresh."
+	return "Left/Right to switch sub-tabs (Skills, Plugins, MCPs, Agents, Models, Tools, Memory). \"r\" to refresh, \"o\" toggles fast scope (skills+plugins+mcp)."
 }
 
 func (h *HintEngine) logsHint(state SystemState) string {
